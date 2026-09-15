@@ -1281,11 +1281,14 @@ def _default_mass_links(pkg_dir, urdf_rel):
     # fact that the loop below only walks gs.components
 
     def _default_mass(c, seen=frozenset()):
-        # a sub-assembly whose internals were extracted: default only if one of
-        # its parts is (config overrides name URDF links, so inside a collapsed
-        # sub-assembly only the SolidWorks-side resolutions apply)
-        sub = gs.subassemblies.get(c.part_path) if c.is_subassembly else None
-        if sub is not None and sub.components and c.part_path not in seen:
+        if c.is_subassembly:
+            # default only if one of its parts is (config overrides name URDF
+            # links, so inside a collapsed sub-assembly only the SolidWorks-side
+            # resolutions apply).  Internals that were not extracted -- or a
+            # cyclic reference -- cannot be judged, so they stay flagged.
+            sub = gs.subassemblies.get(c.part_path)
+            if sub is None or not sub.components or c.part_path in seen:
+                return True
             inner = seen | {c.part_path}
             return any(
                 _default_mass(p, inner) for p in sub.components
