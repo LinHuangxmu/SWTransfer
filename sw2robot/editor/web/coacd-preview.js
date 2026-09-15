@@ -93,6 +93,15 @@ function collPreviewLoadLink(link, url) {
     target.add(grp);
   }, null, () => { /* a link mesh failing to load is non-fatal */ });
 }
+// The collision mode as named in progress / log lines.  Only 'hull' used to be
+// special-cased, so a primitive / box / cylinder / sphere run reported itself
+// as "CoACD".
+function collModeWord(mode) {
+  if (!mode || mode === 'coacd') { return 'CoACD'; }
+  const key = `coll.${mode}word`;
+  const word = t(key);
+  return word === key ? mode : word;
+}
 async function collPreviewTick() {
   let s;
   try { s = await (await fetch('/api/collision/preview/status')).json(); }
@@ -101,7 +110,7 @@ async function collPreviewTick() {
   // collPreviewAbort() already nulled the poll -- bail before the finalize
   // block below can revert the selector to the old mode and re-apply its parts.
   if (!collPreviewPoll) { return; }
-  const what = s.mode === 'hull' ? t('coll.hullword') : 'CoACD';
+  const what = collModeWord(s.mode);
   // pop each newly-finished link into the viewer + log it once
   for (const [link, url] of Object.entries(s.parts || {})) {
     collPreviewLoadLink(link, url);
@@ -204,7 +213,7 @@ collPreviewGenBtn?.addEventListener('click', async () => {
   setProgressStop(collPreviewStop);
   const mode = collModeSel?.value || 'coacd';
   const q = cqualitySel?.value || 'balanced';
-  const what = mode === 'hull' ? t('coll.hullword') : 'CoACD';
+  const what = collModeWord(mode);
   try {
     const r = await (await fetch(
       `/api/collision/preview/init?mode=${encodeURIComponent(mode)}`

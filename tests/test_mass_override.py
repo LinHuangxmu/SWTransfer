@@ -247,6 +247,50 @@ def test_default_mass_links_respects_resolutions(tmp_path):
     assert flagged == {"still"}      # only the untouched, material-less link
 
 
+def test_default_mass_links_judges_subassembly_links_by_their_parts(tmp_path):
+    """A collapsed sub-assembly link has no material of its own; its SolidWorks
+    mass is the sum of its parts', so only a material-less part inside flags it."""
+    from sw2robot.editor.webserver import _default_mass_links
+    from sw2robot.exporter.state import ComponentState, GraphState, SubGraph
+
+    def part(name, **kw):
+        return ComponentState(name=name, link_name=name.lower(), world=_eye(), **kw)
+
+    def sub(name, path, **kw):
+        return ComponentState(name=name, link_name=name.lower(), world=_eye(),
+                              part_path=path, is_subassembly=True, sw_mass=1.0, **kw)
+
+    subs = {
+        "good.SLDASM": SubGraph(components=[part("A", material="ABS", density=1040.0),
+                                            part("B", material="S45C", density=7850.0)]),
+        "bad.SLDASM": SubGraph(components=[part("C", material="ABS", density=1040.0),
+                                           part("D")]),
+        "outer.SLDASM": SubGraph(components=[part("E", material="ABS", density=1040.0),
+                                             sub("Inner", "innerbad.SLDASM")]),
+        "innerbad.SLDASM": SubGraph(components=[part("F", density=1000.0)]),
+        "mirrored.SLDASM": SubGraph(components=[part("G", mass_inherited_from="g.SLDPRT")]),
+        # a nested sub-assembly whose internals were not extracted, even though
+        # it carries a material value itself
+        "opaque.SLDASM": SubGraph(components=[part("H", material="ABS", density=1040.0),
+                                              sub("Hidden", "notextracted.SLDASM",
+                                                  material="ABS", density=1040.0)]),
+        # a (malformed) cycle must terminate, and cannot clear the flag
+        "loop.SLDASM": SubGraph(components=[part("I", material="ABS", density=1040.0),
+                                            sub("Again", "loop.SLDASM")]),
+    }
+    comps = [sub("Good", "good.SLDASM"), sub("Bad", "bad.SLDASM"),
+             sub("Outer", "outer.SLDASM"), sub("Mirrored", "mirrored.SLDASM"),
+             sub("Opaque", "opaque.SLDASM"), sub("Loop", "loop.SLDASM"),
+             # internals not extracted: nothing to judge by, stays flagged
+             sub("Unknown", "unknown.SLDASM")]
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    GraphState(robot_name="demo", source_assembly="x.SLDASM", components=comps,
+               subassemblies=subs).save(str(pkg / "graph.json"))
+    flagged = _default_mass_links(str(pkg), "urdf/demo.urdf")
+    assert flagged == {"bad", "outer", "opaque", "loop", "unknown"}
+
+
 def test_default_mass_links_empty_without_graph(tmp_path):
     from sw2robot.editor.webserver import _default_mass_links
     assert _default_mass_links(str(tmp_path), "urdf/demo.urdf") == set()

@@ -107,6 +107,7 @@ Releases = "https://github.com/jsk-ros-pkg/solidworks_urdf_exporter2/releases"
 
 [project.scripts]
 sw2urdf = "sw2robot.exporter.export:main"     # extract + build (needs SolidWorks)
+sw2urdf-extract = "sw2robot.exporter.extract:main"  # extract only / --refresh frames
 sw2robot = "sw2robot.editor.cli:main"        # headless build/edit/export CLI
 sw2robot-web = "sw2robot.editor.webserver:main"  # the browser editor server
 

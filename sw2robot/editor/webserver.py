@@ -1240,7 +1240,10 @@ def _default_mass_links(pkg_dir, urdf_rel):
     (`mass_reviewed:`).  A mirror copy that already took its source part's mass
     properties (``mass_inherited_from``) is resolved too -- its material really
     is unset, but the weight it carries is the source's real one, not a
-    default.  Returns an empty set for a non-CAD / missing package."""
+    default.  A sub-assembly link never carries a material of its own -- its
+    SolidWorks mass is the sum of its parts' -- so it is judged by those parts
+    (recursively) when their extract is available.  Returns an empty set for a
+    non-CAD / missing package."""
     if not pkg_dir or not urdf_rel:
         return set()
     gj = os.path.join(pkg_dir, "graph.json")
@@ -1277,14 +1280,30 @@ def _default_mass_links(pkg_dir, urdf_rel):
     # never be flagged -- but say so explicitly rather than leaving it to the
     # fact that the loop below only walks gs.components
 
+    def _default_mass(c, seen=frozenset()):
+        if c.is_subassembly:
+            # default only if one of its parts is (config overrides name URDF
+            # links, so inside a collapsed sub-assembly only the SolidWorks-side
+            # resolutions apply).  Internals that were not extracted -- or a
+            # cyclic reference -- cannot be judged, so they stay flagged.
+            sub = gs.subassemblies.get(c.part_path)
+            if sub is None or not sub.components or c.part_path in seen:
+                return True
+            inner = seen | {c.part_path}
+            return any(
+                _default_mass(p, inner) for p in sub.components
+                if not (getattr(p, "mass_inherited_from", None)
+                        or getattr(p, "sw_mass_overridden", False)))
+        material_unset = not c.material
+        density_default = (c.density is not None
+                           and abs(c.density - _DEFAULT_SW_DENSITY) < 1.0)
+        return material_unset or density_default
+
     flagged = set()
     for c in gs.components:
         if _resolved(c):
             continue
-        material_unset = not c.material
-        density_default = (c.density is not None
-                           and abs(c.density - _DEFAULT_SW_DENSITY) < 1.0)
-        if material_unset or density_default:
+        if _default_mass(c):
             flagged.add(c.link_name)
     return flagged
 
