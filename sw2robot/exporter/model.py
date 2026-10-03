@@ -3,11 +3,11 @@
 Policy: one top-level component = one URDF link.  The link tree is a spanning
 tree over the mate-connectivity graph rooted at a base component.
 
-Joint type per tree edge is inferred from the mates connecting the two links:
-a **CONCENTRIC** mate (shared cylinder axis) makes the edge **revolute** about
-that axis; otherwise the edge is **fixed**.  (This family of assemblies is fully
-constrained -- closed loops -- so ``GetRemainingDOFs`` yields no movable DOF;
-the concentric-axis heuristic recovers the intended hinges.)
+Joint type per tree edge is inferred from the mates connecting the two links.
+On Windows extraction, the SolidWorks solver is queried first (with the
+classic concentric/geometry classifier retained as a fallback); cached solver
+results are then consumed by the SolidWorks-free build phase.  This is useful
+for assemblies whose mate graph is globally coupled or under-constrained.
 
 Frames: each link gets an *anchor* frame.  Revolute links anchor a world-aligned
 frame on the rotation axis (so the URDF joint rotates the part about the real
@@ -17,6 +17,7 @@ back with the link's ``<visual>`` origin.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from .state import (
     MateEdge,
     MateGeo,
     ReferenceAxisState,
+    SolverDOFState,
     SubGraph,
 )
 from .sw2urdf_import import (
@@ -47,7 +49,7 @@ from .sw2urdf_import import (
     reconstruct_sw2urdf_config_geometric,
 )
 from .sw2urdf_import._common import _axis_line
-from .swcom import as_iface, safe_call, safe_prop
+from .swcom import as_iface, safe_call, safe_prop, swconst_value
 
 MATE_TYPES = {0: "COINCIDENT", 1: "CONCENTRIC", 2: "PERPENDICULAR",
               3: "PARALLEL", 4: "TANGENT", 5: "DISTANCE", 6: "ANGLE",
@@ -81,7 +83,8 @@ def safe_name(raw):
 # compound part names that merely contain them -- NejiNeji's "screwlock" /
 # "ScrewRing" connectors and "Pinion" gears are structural, not fasteners.
 _FASTENER_WORD = re.compile(
-    r"(?i)(?:bolt|screw(?![a-z])|hex[\s_-]*socket|socket[\s_-]*head|washer|"
+    r"(?i)(?:bolt|screw(?![a-z]|[\s_-]*rod\b)|hex[\s_-]*socket|"
+    r"socket[\s_-]*head|washer|"
     r"[\s_-]nut\b|clinch|self[\s_-]*clinch|rivet|dowel|(?<![a-z])pin(?![a-z])|"
     r"[\s_-]stud\b|fastener|(?<![a-z])vida(?![a-z])|"   # vida = screw (TR)
     r"ねじ|ネジ|ビス|ボルト|ナット|ワッシャ|座金|止めねじ|皿ねじ|ピン)")
@@ -308,6 +311,10 @@ class Component:
     world: np.ndarray            # 4x4 component local->world (assembled pose)
     fixed: bool
     dof: int
+    # Raw component-level SolidWorks solver snapshot.  Unlike an edge verdict,
+    # this describes the component in the current solved assembly and is used
+    # to recover motion when several mates/loops connect the same pair.
+    solver_dof: dict | None = None
     mesh_file: str | None = None
     visual_xyz: list = field(default_factory=lambda: [0, 0, 0])
     visual_rpy: list = field(default_factory=lambda: [0, 0, 0])
@@ -869,10 +876,23 @@ def extract_components(doc, exclude=None, progress=None,
         except Exception:
             world = np.eye(4)
         fixed = bool(safe_call(ct, "IsFixed"))
+        # ``GetRemainingDOFs`` does *not* return the number of remaining
+        # freedoms in its first item.  On SolidWorks 2025 a fixed component
+        # returns ``2`` there, while all R1/R2/L1/L2 status slots are zero.
+        # The actual freedoms are the status slots whose value is exactly 1;
+        # keep the component-level field consistent with ``IsFixed`` so the
+        # editor/graph can never display a fixed component as having two DOF.
         try:
-            dof = ct.GetRemainingDOFs()[0]
+            raw_dof = _solver_dof_tuple(ct)
+            if fixed:
+                dof = 0
+            elif raw_dof is None:
+                dof = None
+            else:
+                dof = sum(_solver_int(raw_dof[i]) == 1
+                           for i in (1, 5, 9, 11))
         except Exception:
-            dof = None
+            dof = 0 if fixed else None
         ln = safe_name(name)
         base = ln
         i = 1
@@ -1614,23 +1634,1165 @@ def classify_edge_geo(mates, strict=False, min_radius=None):
         f"geo: under-constrained ({k} DOF) -> fixed; verify" + extra
 
 
+def _solver_int(value):
+    """Coerce a SolidWorks enum/VARIANT to ``int`` without raising."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        inner = getattr(value, "value", None)
+        try:
+            return int(inner) if inner is not None else None
+        except (TypeError, ValueError):
+            return None
+
+
+def _solver_vec(value, normalize=False):
+    """Read a MathPoint/MathVector (or a plain sequence) as a 3-vector."""
+    if value is None:
+        return None
+    data = safe_prop(value, "ArrayData")
+    if data is None:
+        data = value
+    try:
+        arr = np.asarray(list(data), dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
+        return None
+    arr = arr[:3].astype(float)
+    if normalize:
+        n = float(np.linalg.norm(arr))
+        if n < 1e-12:
+            return None
+        arr /= n
+    return [float(x) for x in arr]
+
+
+def _solver_dof_tuple(child):
+    """Call the typed SolidWorks ``GetRemainingDOFs`` method.
+
+    The makepy wrapper exposes the C# ``out`` parameters as a tuple whose first
+    item is the integer return value, followed by R1/R2/L1/L2 status and
+    geometry values.  Keep this small adapter separate so a future SolidWorks
+    wrapper variation can be handled without touching classification.
+    """
+    try:
+        raw = child.GetRemainingDOFs()
+    except Exception:
+        return None
+    if not isinstance(raw, (tuple, list)):
+        raw = (raw,)
+    raw = list(raw)
+    # return value + 12 out parameters
+    if len(raw) < 13:
+        return None
+    return raw[:13]
+
+
+def _solver_state_from_tuple(raw, parent_name=None, child_name=None,
+                             child_origin=None, child_fixed=None):
+    """Normalize the raw COM tuple to a JSON-safe solver state dictionary."""
+    if raw is None:
+        return None
+    rem = _solver_int(raw[0])
+
+    def axis(status_i, point_i, dir_status_i, direction_i):
+        return {
+            "status": _solver_int(raw[status_i]),
+            "direction_status": _solver_int(raw[dir_status_i]),
+            "point": _solver_vec(raw[point_i]),
+            "direction": _solver_vec(raw[direction_i], normalize=True),
+        }
+
+    # The order is the order documented by the classic exporter:
+    # R1Status, RPoint1, R1DirStatus, RDir1,
+    # R2Status, RPoint2, R2DirStatus, RDir2,
+    # L1Status, LDir1, L2Status, LDir2.
+    rotations = [axis(1, 2, 3, 4), axis(5, 6, 7, 8)]
+    translations = [
+        {"status": _solver_int(raw[9]), "direction_status": None,
+         "point": None, "direction": _solver_vec(raw[10], normalize=True)},
+        {"status": _solver_int(raw[11]), "direction_status": None,
+         "point": None, "direction": _solver_vec(raw[12], normalize=True)},
+    ]
+    return {
+        "remaining_dofs": rem,
+        "rotations": rotations,
+        "translations": translations,
+        "queried_parent": parent_name,
+        "queried_child": child_name,
+        "child_fixed": (bool(child_fixed) if child_fixed is not None else None),
+        "child_origin": ([float(x) for x in child_origin]
+                          if child_origin is not None else None),
+        # The typed wrapper must return all six status values as integers too;
+        # accepting a bare return value would turn a failed [out]-parameter
+        # marshal into a false "fully constrained" verdict.
+        "valid": (rem is not None and all(
+            _solver_int(raw[i]) is not None for i in (1, 3, 5, 7, 9, 11))),
+        "note": None,
+    }
+
+
+def _solver_active(axis):
+    """Whether one R/L slot represents a usable freedom.
+
+    The classic exporter uses status == 1.  Keep that proven convention rather
+    than guessing from ``remaining_dofs == 1``; the latter is not how the
+    undocumented API behaves on the tested SolidWorks versions.
+    """
+    return (isinstance(axis, dict) and axis.get("status") == 1
+            and axis.get("direction") is not None)
+
+
+def _solver_active_axes(state):
+    """Return the usable native R/L slots from one cached solver state.
+
+    The first COM return value is not used to choose a slot.  A slot is a
+    motion signature only when SolidWorks marked it with status ``1`` and
+    supplied a non-degenerate direction; a rotational slot also needs its
+    direction-status and axis point.  The caller still requires the classic
+    successful ``remaining_dofs == 0`` result before promoting the signature.
+    """
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict) or not state.get("valid"):
+        return []
+    out = []
+    for slot, axis in enumerate(state.get("rotations") or [], 1):
+        if not _solver_active(axis):
+            continue
+        if axis.get("direction_status") != 1 or axis.get("point") is None:
+            continue
+        out.append({"type": "revolute", "slot": f"R{slot}",
+                    "point": axis.get("point"),
+                    "direction": np.asarray(axis["direction"], float)})
+    for slot, axis in enumerate(state.get("translations") or [], 1):
+        if not _solver_active(axis):
+            continue
+        out.append({"type": "prismatic", "slot": f"L{slot}",
+                    "point": None,
+                    "direction": np.asarray(axis["direction"], float)})
+    return out
+
+
+def _limit_joint_record(spec, rec=None):
+    """Convert an extracted LimitJoint spec to an adjacency-edge record.
+
+    ``extract_limit_joints`` returns document-local coordinates and the mate
+    side ``a`` that defines the positive travel direction.  The in-memory
+    adjacency representation uses numpy arrays for geometry because the build
+    phase performs vector operations on it.  Keeping this conversion in one
+    place lets top-level and sub-assembly extraction use exactly the same
+    semantics.
+    """
+    if not isinstance(spec, dict):
+        return None
+    try:
+        point = np.asarray(spec["axis_point"], float)
+        direction = np.asarray(spec["axis_dir"], float)
+        if point.shape != (3,) or direction.shape != (3,):
+            return None
+        n = float(np.linalg.norm(direction))
+        if n < 1e-9:
+            return None
+        direction = direction / n
+        lower = float(spec["lower"])
+        upper = float(spec["upper"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # A LimitAngle's entity-plane point is not necessarily on the hinge axis.
+    # If the same edge also has a concentric mate, use that axis line for the
+    # revolute while retaining the limit mate's direction/sign and bounds.
+    if str(spec.get("type", "")).lower() == "revolute" and rec:
+        cax = _concentric_axis_of(rec)
+        if cax is not None:
+            cp, cd = cax
+            if abs(float(cd @ direction)) > 0.99:
+                point = np.asarray(cp, float)
+                if float(cd @ direction) < 0.0:
+                    direction = -np.asarray(cd, float)
+
+    return {
+        "type": str(spec.get("type") or "").lower(),
+        "ref": spec.get("a"),
+        "axis": (point, direction),
+        "lower": lower,
+        "upper": upper,
+    }
+
+
+def _attach_limit_joints(adjacency, specs):
+    """Attach extracted LimitDistance/LimitAngle specs to their mate edges.
+
+    This is primarily needed for sub-assembly graphs: unlike the top-level
+    graph, their limit-joint list is not a separate GraphState field.  Keeping
+    the normalized record on the edge means it survives JSON serialization and
+    can be transformed when that sub-assembly is expanded into the root graph.
+    """
+    attached = 0
+    for spec in specs or []:
+        try:
+            key = frozenset((spec["a"], spec["b"]))
+        except (KeyError, TypeError):
+            continue
+        rec = adjacency.setdefault(key, {"types": [], "axis": None,
+                                         "mates": []})
+        lj = _limit_joint_record(spec, rec)
+        if lj is None:
+            continue
+        rec["limit_joint"] = lj
+        attached += 1
+    return attached
+
+
+def _solver_motion_signature(rec, tree_only=True):
+    """Return one native motion signature for an edge, or ``None``.
+
+    Native motion is promoted only for a provisional tree edge.  Loop-edge
+    queries remain evidence for clustering/diagnostics, but are not allowed to
+    invent a second URDF joint around a closed loop.
+    """
+    state = rec.get("solver_dof") if isinstance(rec, dict) else None
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict) or not state.get("valid"):
+        return None
+    if tree_only and state.get("tree_edge") is not True:
+        return None
+    if _solver_int(state.get("remaining_dofs")) != 0:
+        return None
+    active = _solver_active_axes(state)
+    if len(active) != 1:
+        return None
+    item = active[0]
+    direction = np.asarray(item["direction"], float)
+    n = float(np.linalg.norm(direction))
+    if n < 1e-9:
+        return None
+    return {
+        "type": item["type"],
+        "slot": item["slot"],
+        "point": item["point"],
+        "direction": direction / n,
+        "component": state.get("queried_child"),
+    }
+
+
+def _component_solver_motion(component):
+    """Return a single usable motion reported directly for *component*.
+
+    ``GetRemainingDOFs`` is component-scoped, not Mate-scoped.  A dense
+    assembly can therefore report the right motion on a carriage while no
+    individual provisional edge has yet been selected.  Keep this evidence
+    conservative: only a valid zero-result with exactly one fully described
+    axis is allowed to influence edge selection.
+    """
+    state = getattr(component, "solver_dof", None)
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict) or not state.get("valid"):
+        return None
+    if _solver_int(state.get("remaining_dofs")) != 0:
+        return None
+    active = _solver_active_axes(state)
+    if len(active) != 1:
+        return None
+    axis = active[0]
+    direction = np.asarray(axis.get("direction"), float)
+    n = float(np.linalg.norm(direction))
+    if n < 1e-9:
+        return None
+    point = axis.get("point")
+    return {"type": axis["type"], "slot": axis["slot"],
+            "point": (np.asarray(point, float) if point is not None else None),
+            "direction": direction / n,
+            "component": getattr(component, "name", None)}
+
+
+def _component_motion_edge_score(component, other, rec, motion):
+    """Score an incident Mate edge as the carrier of a component motion.
+
+    The score intentionally rewards only strong, explainable evidence.  This
+    prevents a global component snapshot from turning every incident Mate
+    into a phantom joint, while still recovering the common rail/carriage and
+    bearing/shaft cases where the Mate axis agrees with the solver axis.
+    """
+    if not isinstance(rec, dict) or rec.get("force_fixed"):
+        return -1e9
+    score = 0.0
+    types = set(rec.get("types") or [])
+    edge_axis = rec.get("axis") or _concentric_axis_of(rec)
+    inferred_type = None
+    # Many linear guides are represented by several COINCIDENT mates and have
+    # no single ``rec['axis']``.  Reuse the existing geometric classifier only
+    # as an axis hint here; the Solver result remains authoritative for the
+    # final joint.  This is what connects a carriage snapshot to its rail
+    # instead of allowing a zero-DOF support edge to hide the motion.
+    if edge_axis is None and rec.get("mates"):
+        try:
+            inferred_type, inferred_axis, _inferred_note = classify_edge_geo(
+                rec.get("mates") or [], strict=False)
+            if inferred_axis is not None:
+                edge_axis = inferred_axis
+        except Exception:
+            inferred_type = None
+    if edge_axis is not None:
+        try:
+            ep, ed = edge_axis
+            ed = np.asarray(ed, float)
+            ne = float(np.linalg.norm(ed))
+            if ne > 1e-9:
+                dot = abs(float((ed / ne) @ motion["direction"]))
+                if dot > 0.995:
+                    score += 8.0
+                elif dot > 0.95:
+                    score += 4.0
+                else:
+                    score -= 3.0
+                if motion["type"] == "revolute" and motion.get("point") is not None:
+                    # A rotational solver point should lie on the Mate axis.
+                    p = np.asarray(motion["point"], float)
+                    q = np.asarray(ep, float)
+                    score += 2.0 if np.linalg.norm(
+                        np.cross(ed / ne, p - q)) < 2e-3 else -1.0
+        except Exception:
+            pass
+    if motion["type"] == "revolute" and "CONCENTRIC" in types:
+        score += 2.0
+    if inferred_type == motion["type"]:
+        score += 4.0
+    if motion["type"] == "prismatic" and types & {
+            "DISTANCE", "LIMITDISTANCE", "COINCIDENT", "PARALLEL"}:
+        score += 0.5
+    if bool(getattr(other, "fixed", False)):
+        score += 1.0
+    score += min(len(types), 3) * 0.1
+    return score
+
+
+def _attach_component_solver_evidence(comps, adjacency, tree_keys):
+    """Attach direct component-level solver snapshots to strong Mate edges.
+
+    This is the large-assembly fast path.  It uses one unmodified solver read
+    per component and only stores the result on edges whose geometry agrees
+    with the reported axis.  Ambiguous/no-axis results (free, planar,
+    spherical, or fixed components) remain diagnostics and never create a
+    joint by themselves.
+    """
+    by_name = {c.name: c for c in comps}
+    attached = 0
+    for component in comps:
+        motion = _component_solver_motion(component)
+        if motion is None:
+            continue
+        candidates = []
+        for key, rec in adjacency.items():
+            if component.name not in key or len(key) != 2:
+                continue
+            other_name = next(n for n in key if n != component.name)
+            other = by_name.get(other_name)
+            candidates.append((
+                _component_motion_edge_score(component, other, rec, motion),
+                key, other_name, rec))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: (-item[0], sorted(item[1])))
+        best_score, _best_key, _best_other_name, _best_rec = candidates[0]
+        # If there is no geometric axis, accept only an unambiguous incident
+        # edge.  With several axis-less mates there is no honest association.
+        if best_score < 1.0 and len(candidates) != 1:
+            continue
+        # Parallel supports (for example the two rails of one carriage) can
+        # legitimately carry the same component motion.  Keep all near-best
+        # axis-compatible edges so native motion grouping can weld the support
+        # pieces instead of inventing two independent joints.
+        selected = [item for item in candidates
+                    if item[0] >= max(4.0, best_score - 1.5)]
+        if not selected:
+            selected = [candidates[0]]
+        for score, key, other_name, rec in selected:
+            # Preserve a stronger targeted query or a stronger component
+            # association already attached by another component.
+            old_score = rec.get("_solver_evidence_score", -np.inf)
+            if rec.get("solver_dof") is not None and score <= old_score:
+                continue
+            state = _solver_state_dict(getattr(component, "solver_dof", None))
+            if state is None:
+                continue
+            state["queried_parent"] = other_name
+            state["queried_child"] = component.name
+            state["tree_edge"] = key in tree_keys
+            rec["solver_dof"] = state
+            rec["_solver_evidence_score"] = float(score)
+            attached += 1
+    return attached
+
+
+def _native_motion_groups(adjacency):
+    """Cluster components that share one native DOF and zero relative DOF.
+
+    Returns ``(component_to_group, groups, rigid_ties, native_loop_edges)``.
+    A group is an implementation-level motion group, not yet a URDF joint:
+    exactly one tree edge will later represent its motion and the remaining
+    members will be attached through fixed edges.
+    """
+    signatures = {}
+    for rec in adjacency.values():
+        sig = _solver_motion_signature(rec, tree_only=True)
+        if sig is None or not sig.get("component"):
+            continue
+        name = sig["component"]
+        old = signatures.get(name)
+        if old is None:
+            signatures[name] = sig
+        elif old["type"] != sig["type"] \
+                or abs(float(old["direction"] @ sig["direction"])) < 0.98:
+            # A component with conflicting native signatures is ambiguous;
+            # leave it to the normal graph/SVD fallback.
+            signatures.pop(name, None)
+
+    names = set(signatures)
+    parent = {name: name for name in names}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    rigid_ties = set()
+    for key, rec in adjacency.items():
+        if len(key) != 2 or not _solver_zero_dof_no_axis(rec):
+            continue
+        a, b = tuple(key)
+        sa, sb = signatures.get(a), signatures.get(b)
+        if sa is None or sb is None or sa["type"] != sb["type"]:
+            continue
+        if abs(float(sa["direction"] @ sb["direction"])) < 0.98:
+            continue
+        union(a, b)
+        rigid_ties.add(key)
+
+    groups = {}
+    for name in names:
+        groups.setdefault(find(name), []).append(name)
+    groups = {root: sorted(members) for root, members in groups.items()}
+    component_to_group = {
+        name: root for root, members in groups.items() for name in members
+    }
+    native_loop_edges = {
+        key for key, rec in adjacency.items()
+        if key in adjacency and isinstance(rec.get("solver_dof"), dict)
+        and rec["solver_dof"].get("tree_edge") is False
+        and _solver_active_axes(rec["solver_dof"])
+    }
+    return component_to_group, groups, rigid_ties, native_loop_edges
+
+
+def _solver_zero_dof_no_axis(rec):
+    """True when a valid cached query found no usable R/L freedom."""
+    state = rec.get("solver_dof") if isinstance(rec, dict) else None
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict) or not state.get("valid"):
+        return False
+    if _solver_int(state.get("remaining_dofs")) != 0:
+        return False
+    return not any(
+        _solver_active(axis)
+        for group in ("rotations", "translations")
+        for axis in (state.get(group) or [])
+    )
+
+
+def _solver_joint(rec):
+    """Return ``(jtype, axis, note)`` from a cached SolidWorks solver result.
+
+    SolidWorks reports the component's solved freedoms, not a Mate object, so
+    only an unambiguous single R1/R2/L1/L2 freedom is promoted to a robot joint.
+    For a provisional TREE edge, a valid zero-DOF result with no active axis is
+    also authoritative and becomes ``fixed``.  A non-tree edge is allowed to
+    fall back to mate geometry: in a closed loop SolidWorks may report the
+    component globally constrained even though that redundant edge carries the
+    intended hinge semantics.  ``tree_edge`` is persisted in newer extracts;
+    older graphs keep the historical geometry fallback when it is absent.
+    """
+    state = rec.get("solver_dof") if isinstance(rec, dict) else None
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict) or not state.get("valid"):
+        return None
+    # A non-tree edge is only a diagnostic query.  In a closed loop its
+    # component may share the tree motion even though that edge is redundant;
+    # leave the established mate-geometry fallback in charge there.
+    if state.get("tree_edge") is False:
+        return None
+    remaining = _solver_int(state.get("remaining_dofs"))
+    child_fixed = state.get("child_fixed") is True
+    if remaining != 0 and not (remaining == 2 and child_fixed):
+        return None
+    active_axes = _solver_active_axes(state)
+    active = [(axis["type"], axis) for axis in active_axes]
+    if not active:
+        if state.get("tree_edge") is True or child_fixed:
+            return "fixed", None, \
+                "solidworks solver: no remaining DOF (fixed)"
+        return None
+    if len(active) != 1:
+        return None
+    jtype, axis = active[0]
+    if jtype == "revolute" and rec.get("strict"):
+        # A linear axis module contains bearings, lead screws, motor couplers
+        # and cable-chain hardware whose own solver rotation is real CAD motion
+        # but is not a robot DOF.  Expose the carriage translation instead;
+        # otherwise every bearing/screw support becomes a spurious revolute
+        # joint in the exported gantry.  Keep this scoped to named axis-module
+        # internals so genuine rotary mechanisms elsewhere remain available.
+        endpoint_text = " ".join(str(x).lower()
+                                  for x in (state.get("queried_parent"),
+                                            state.get("queried_child")))
+        if ("axis_module" in endpoint_text
+                and re.search(r"(?:bearing|screw[_-]?rod|motor(?:[_-]end)?|"
+                              r"idler[_-]?end|cable[_-]?chain|base[_-]profile)",
+                              endpoint_text)):
+            return "fixed", None, \
+                "solidworks solver: axis-module drive/support rotation " \
+                "excluded; carriage translation is the exported DOF"
+        rmax = _max_concentric_radius(_dedup_geo(rec.get("mates") or []))
+        if rmax is not None and rmax < strict_min_radius(
+                rec.get("strict_min_radius")):
+            return "fixed", None, \
+                (f"solidworks solver: free axis but r={rmax*1000:.1f}mm "
+                 "= fastener, not bearing -> fixed")
+    direction = np.asarray(axis["direction"], float)
+    n = float(np.linalg.norm(direction))
+    if n < 1e-9:
+        return None
+    direction /= n
+    if jtype == "revolute":
+        point = axis.get("point")
+        if point is None:
+            return None
+        point = np.asarray(point, float)
+    else:
+        # L1/L2 return only a direction.  The assembled child origin is the
+        # same fallback used by the classic exporter; a mate axis point is a
+        # better fallback when the query fixture has one.
+        point = state.get("child_origin")
+        if point is None:
+            old = rec.get("axis")
+            if old is not None:
+                point = old[0]
+        if point is None:
+            for mate in rec.get("mates") or []:
+                points = mate.get("points") or []
+                if points:
+                    point = points[0]
+                    break
+        if point is None:
+            point = [0.0, 0.0, 0.0]
+        point = np.asarray(point, float)
+    slot = "R" if jtype == "revolute" else "L"
+    return jtype, (point, direction), \
+        f"solidworks solver: single {slot} freedom"
+
+
+def _solver_state_dict(value):
+    """Return a detached dict for a cached solver result."""
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    return copy.deepcopy(value) if isinstance(value, dict) else None
+
+
+def _expanded_stage_part(name, stage):
+    """Whether *name* is an expanded ``Carriage_<stage>`` component."""
+    if not isinstance(name, str) or "/" not in name:
+        return False
+    return re.search(
+        rf"/[^/]*carriage[_-]{int(stage)}(?:[_-][0-9]+)?$",
+        name, flags=re.IGNORECASE) is not None
+
+
+def _expanded_linear_rail(name):
+    """Whether *name* is an expanded ``Linear_Rail`` component."""
+    if not isinstance(name, str) or "/" not in name:
+        return False
+    return re.search(
+        r"/[^/]*linear[_-]rail(?:[_-][0-9]+)?$",
+        name, flags=re.IGNORECASE) is not None
+
+
+def _normalize_expanded_rail_carriage_parent_map(comps, parent_of,
+                                                 root=None):
+    """Orient an expanded linear-guide chain from fixed rail to payload.
+
+    The SolidWorks mate graph is undirected, so the spanning-tree BFS may
+    occasionally choose the moving carriage as the parent of the fixed rail,
+    or place a stage/linker above the rail.  A URDF prismatic joint with that
+    inverse tree direction makes the rail/base side move while the gantry
+    appears stationary, which is especially visible on one side of a parallel
+    Y support.
+
+    For the expanded axis-module naming convention, the preferred local chain
+    is ``Base_Profile -> Linear_Rail -> Carriage_0 -> Carriage_1`` and, when a
+    direct ``xy_Linker`` edge is present, ``Carriage_1 -> xy_Linker``.  Each
+    local reversal is a tree rotation; all unrelated descendants retain their
+    parent, so the operation cannot split a carriage sub-tree or introduce a
+    cycle.
+    """
+    by_name = {c.name: c for c in comps}
+    def orient(parent, child):
+        """Rotate one existing tree edge to ``parent -> child``."""
+        if parent_of.get(child) == parent:
+            return False
+        if parent_of.get(parent) != child:
+            return False
+        grandparent = parent_of.get(child)
+        # Do not make a rooted tree's root into a child of itself.  This also
+        # handles a malformed cyclic map conservatively.
+        if grandparent is None or grandparent == parent:
+            return False
+        parent_of[parent] = grandparent
+        parent_of[child] = parent
+        return True
+
+    changed = 0
+    # Group expanded components by their module instance.  The same helper is
+    # useful for X/Y/Z, but it only changes a module whose selected tree edges
+    # are actually reversed.
+    modules = {}
+    for name in sorted(by_name):
+        if not (_expanded_linear_rail(name)
+                or _expanded_stage_part(name, 0)
+                or _expanded_stage_part(name, 1)
+                or re.search(r"/[^/]*base[_-]profile", name,
+                             re.IGNORECASE)):
+            continue
+        modules.setdefault(name.rsplit("/", 1)[0], set()).add(name)
+
+    for prefix, names in sorted(modules.items()):
+        rails = sorted(n for n in names if _expanded_linear_rail(n))
+        c0s = sorted(n for n in names if _expanded_stage_part(n, 0))
+        c1s = sorted(n for n in names if _expanded_stage_part(n, 1))
+        bases = sorted(n for n in names if re.search(
+            r"/[^/]*base[_-]profile", n, re.IGNORECASE))
+        if not rails or not c0s or not c1s or not bases:
+            continue
+        base_profile, rail, c0, c1 = (bases[0], rails[0], c0s[0], c1s[0])
+
+        # If the linker was selected as the parent of Carriage_1, reverse that
+        # outer edge first.  Doing this before the inner rotations yields the
+        # complete fixed-to-moving chain instead of leaving the linker above
+        # the rail.
+        linkers = sorted(n for n in by_name
+                         if "linker" in n.lower()
+                         and (parent_of.get(c1) == n
+                              or parent_of.get(n) == c1))
+        for linker in linkers:
+            if orient(c1, linker):
+                changed += 1
+                print("      normalized linear guide tree: "
+                      f"'{c1}' -> '{linker}'")
+                break
+
+        # Reverse from the payload inward.  This order is important when the
+        # BFS produced the complete chain in the opposite direction.
+        for parent, child in ((c0, c1), (rail, c0),
+                              (base_profile, rail)):
+            if orient(parent, child):
+                changed += 1
+                print("      normalized linear guide tree: "
+                      f"'{parent}' -> '{child}'")
+
+        # A flexible Y module can be reached through the opposite support's
+        # moving crossbeam in the undirected mate graph.  Its own
+        # ``Base_Profile`` is nevertheless fixed to the machine frame by
+        # external ``Axis_Struct_Link`` mates.  Keep that fixed support on the
+        # static root; otherwise the Y prismatic joint carries the entire rail
+        # body along with the carriage.  The discarded crossbeam edge remains
+        # a closed-loop relation and is intentionally not another URDF tree
+        # edge.
+        if (root is not None and "y_axis_module" in prefix.lower()
+                and any("axis_struct_link" in n.lower()
+                        and parent_of.get(n) == base_profile
+                        for n in by_name)):
+            root_name = getattr(root, "name", root)
+            old_parent = parent_of.get(base_profile)
+            if (old_parent is not None and old_parent != root_name
+                    and base_profile != root_name):
+                parent_of[base_profile] = root_name
+                changed += 1
+                print("      grounded fixed Y support: "
+                      f"'{base_profile}' -> '{root_name}'")
+    return changed
+
+
+def _native_prismatic_axis(rec):
+    """Read one usable native translation axis from an edge record."""
+    state = _solver_state_dict(rec.get("solver_dof")
+                               if isinstance(rec, dict) else None)
+    if not state or not state.get("valid") \
+            or _solver_int(state.get("remaining_dofs")) != 0:
+        return None
+    active = _solver_active_axes(state)
+    if len(active) != 1 or active[0]["type"] != "prismatic":
+        return None
+    direction = np.asarray(active[0]["direction"], float)
+    n = float(np.linalg.norm(direction))
+    if n < 1e-9:
+        return None
+    point = state.get("child_origin")
+    if point is None:
+        old = rec.get("axis") if isinstance(rec, dict) else None
+        point = old[0] if old is not None else [0.0, 0.0, 0.0]
+    return (np.asarray(point, float), direction / n, state)
+
+
+def _zero_solver_state(state, note):
+    """Make a cached native result authoritative as a fixed edge."""
+    out = copy.deepcopy(state)
+    out["remaining_dofs"] = 0
+    out["rotations"] = [
+        {"status": 0, "direction_status": 0, "point": None,
+         "direction": None}
+        for _ in (out.get("rotations") or [None, None])]
+    out["translations"] = [
+        {"status": 0, "direction_status": None, "point": None,
+         "direction": None}
+        for _ in (out.get("translations") or [None, None])]
+    out["child_fixed"] = False
+    out["note"] = note
+    return out
+
+
+def _normalize_expanded_carriage_motion(comps, adjacency):
+    """Move a module-level native slide onto its real rail/carriage edge.
+
+    A flexible SolidWorks sub-assembly often reports the motion of an external
+    ``xy/xz_Linker`` against the whole module.  Once the module is expanded,
+    that same result is attached to the linker--``Carriage_1`` edge, while the
+    actual ``Linear_Rail``--``Carriage_0`` edge may be reported as fixed (or a
+    second copy of the same slide).  Keeping both edges movable makes the
+    linker move while the visible carriage stays behind.  For the known
+    carriage/linker pattern, transfer the native result to the rail edge and
+    make the linker a rigid continuation of the carriage.
+
+    This is deliberately limited to expanded ``*Linker`` connections so a
+    genuinely separate prismatic tool mounted on a carriage is not rewritten.
+    """
+    del comps  # the component names in ``adjacency`` are sufficient here
+    transferred = set()
+    for external_key, external in list(adjacency.items()):
+        a, b = tuple(external_key)
+        carriage = next((n for n in (a, b)
+                         if _expanded_stage_part(n, 1)), None)
+        if carriage is None:
+            continue
+        other = b if carriage == a else a
+        instance = carriage.rsplit("/", 1)[0]
+        if other.startswith(instance + "/") \
+                or "linker" not in other.lower():
+            continue
+        motion = _native_prismatic_axis(external)
+        if motion is None:
+            continue
+        internal_key = None
+        for candidate_key in adjacency:
+            c, d = tuple(candidate_key)
+            if not (c.startswith(instance + "/")
+                    and d.startswith(instance + "/")):
+                continue
+            if not (_expanded_stage_part(c, 0)
+                    or _expanded_stage_part(d, 0)):
+                continue
+            if not (_expanded_linear_rail(c)
+                    or _expanded_linear_rail(d)):
+                continue
+            if candidate_key in transferred:
+                continue
+            internal_key = candidate_key
+            break
+        if internal_key is None:
+            continue
+        internal = adjacency[internal_key]
+        point, direction, external_state = motion
+        internal_state = _solver_state_dict(internal.get("solver_dof"))
+        if internal_state is None:
+            internal_state = copy.deepcopy(external_state)
+        # Keep the internal query's endpoint names/origin, but use the native
+        # R/L slots reported for the module-level motion.
+        moved = copy.deepcopy(external_state)
+        moved["queried_parent"] = internal_state.get("queried_parent")
+        moved["queried_child"] = internal_state.get("queried_child")
+        moved["child_origin"] = internal_state.get(
+            "child_origin", list(point))
+        moved["child_fixed"] = False
+        moved["tree_edge"] = True
+        moved["note"] = "native carriage motion transferred from linker"
+        internal["solver_dof"] = moved
+        external["solver_dof"] = _zero_solver_state(
+            external_state,
+            "native carriage motion transferred to rail/carriage edge")
+        internal["native_motion_transfer"] = {
+            "source": tuple(external_key),
+            "axis": (point, direction),
+        }
+        external["native_motion_transfer"] = {
+            "target": tuple(internal_key),
+            "axis": (point, direction),
+        }
+        transferred.add(internal_key)
+        print("      native carriage motion: "
+              f"{other} -> {tuple(internal_key)}")
+    return len(transferred)
+
+
+def _sw_select_components(doc, components):
+    """Select components for an AssemblyDoc Fix/Unfix command."""
+    model = as_iface(doc, "IModelDoc2")
+    if model is None:
+        return False
+    safe_call(model, "ClearSelection2", True)
+    manager = safe_prop(model, "SelectionManager")
+    data = safe_call(manager, "CreateSelectData") if manager else None
+    selected = 0
+    for component in components:
+        ok = None
+        try:
+            ok = component.Select4(True, data, False)
+        except Exception:
+            try:
+                ok = component.Select4(True, data)
+            except Exception:
+                ok = False
+        if ok is not False:
+            selected += 1
+    return selected == len(components)
+
+
+def _sw_fix_components(doc, components):
+    """Fix the requested components and return only those that were floating."""
+    components = [c for c in components if c is not None]
+    to_unfix = [c for c in components if not bool(safe_call(c, "IsFixed"))]
+    if not components:
+        return to_unfix
+    try:
+        if _sw_select_components(doc, components):
+            assy = as_iface(doc, "IAssemblyDoc")
+            if assy is not None:
+                assy.FixComponent()
+    finally:
+        safe_call(as_iface(doc, "IModelDoc2"), "ClearSelection2", True)
+    return to_unfix
+
+
+def _sw_unfix_components(doc, components):
+    """Undo the temporary FixComponent operation."""
+    components = [c for c in components if c is not None]
+    if not components:
+        return
+    try:
+        if _sw_select_components(doc, components):
+            assy = as_iface(doc, "IAssemblyDoc")
+            if assy is not None:
+                try:
+                    assy.UnfixComponent()
+                except Exception:
+                    # Some releases expose FloatComponent instead.
+                    safe_call(assy, "FloatComponent")
+    finally:
+        safe_call(as_iface(doc, "IModelDoc2"), "ClearSelection2", True)
+
+
+def _sw_rebuild(doc):
+    """Best-effort solve/rebuild after temporary solver-state changes."""
+    model = as_iface(doc, "IModelDoc2")
+    if model is None:
+        return
+    try:
+        model.EditRebuild3()
+    except Exception:
+        try:
+            model.ForceRebuild3(False)
+        except Exception:
+            pass
+
+
+def _sw_limit_feature_suppression(feature, suppress):
+    """Suppress/unsuppress a mate feature in the active configuration."""
+    action_name = ("swSuppressFeature" if suppress
+                   else "swUnSuppressFeature")
+    action = swconst_value(action_name, 0 if suppress else 1)
+    which = swconst_value("swThisConfiguration", 1)
+    try:
+        feature.SetSuppression2(action, which, None)
+        return True
+    except Exception:
+        # A few late-bound wrappers omit the optional configuration argument.
+        try:
+            feature.SetSuppression2(action, which)
+            return True
+        except Exception:
+            return False
+
+
+def _sw_suppress_limit_mates(component):
+    """Suppress variable limit mates on a component; return changed features."""
+    mates = list(safe_call(component, "GetMates") or [])
+    changed = []
+    variable_count = 0
+    seen = set()
+    for raw in mates:
+        mate = as_iface(raw, "IMate2")
+        if mate is None:
+            continue
+        lo = safe_prop(mate, "MinimumVariation")
+        hi = safe_prop(mate, "MaximumVariation")
+        try:
+            variable = abs(float(lo) - float(hi)) > 1e-12
+        except (TypeError, ValueError):
+            variable = False
+        if not variable:
+            continue
+        variable_count += 1
+        feature = as_iface(mate, "IFeature")
+        if feature is None:
+            continue
+        marker = id(getattr(feature, "_oleobj_", feature))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if _sw_limit_feature_suppression(feature, True):
+            changed.append(feature)
+    if variable_count and len(changed) < variable_count:
+        name = safe_prop(component, "Name2") or "<component>"
+        print(f"      WARN: could not suppress {variable_count - len(changed)} "
+              f"Limit Mate feature(s) on {name}; querying native DOF "
+              "with the current limits")
+    return changed
+
+
+def _sw_restore_limit_mates(features):
+    for feature in features or []:
+        _sw_limit_feature_suppression(feature, False)
+
+
+def _solver_component_map(doc):
+    """Top-level Name2 -> typed IComponent2 map for one assembly document."""
+    out = {}
+    # ``GetComponents`` belongs to IAssemblyDoc, not IModelDoc2.  A late-bound
+    # CDispatch happens to expose it, but the makepy wrapper correctly does not;
+    # use the typed assembly interface first so attach/copy paths behave the
+    # same on every SolidWorks version.
+    assy = as_iface(doc, "IAssemblyDoc")
+    raw_components = safe_call(assy, "GetComponents", True) if assy else None
+    if raw_components is None:
+        raw_components = safe_call(doc, "GetComponents", True)
+    for raw in list(raw_components or []):
+        ct = as_iface(raw, "IComponent2")
+        name = safe_prop(ct, "Name2") if ct else None
+        if name:
+            out[str(name)] = ct
+    return out
+
+
+def _provisional_tree_edges(comps, adjacency, ground):
+    """Get a deterministic tree before solver results are available."""
+    if not comps or not adjacency:
+        return {}
+    base = choose_base(comps, ground, adjacency=adjacency)
+    try:
+        parent_of, _ = _auto_parent_map(comps, adjacency, base)
+    except Exception:
+        # A plain BFS is enough to choose query direction if a malformed graph
+        # prevents the richer tree builder from running.
+        parent_of, seen = {}, {base.name}
+        while True:
+            added = False
+            for key in sorted(adjacency, key=lambda k: sorted(k)):
+                a, b = tuple(key)
+                if a in seen and b not in seen:
+                    parent_of[b], seen = a, seen | {b}; added = True
+                elif b in seen and a not in seen:
+                    parent_of[a], seen = b, seen | {a}; added = True
+            if not added:
+                break
+    return parent_of
+
+
+def _capture_solver_dofs(doc, comps, adjacency, ground):
+    """Populate edge records with SolidWorks-solved DOFs.
+
+    This is intentionally extraction-only.  It fixes the provisional parent
+    chain, suppresses the child's variable limit mates, asks SolidWorks for the
+    remaining freedoms, and restores every temporary change in ``finally``.
+    Unsupported/failed calls simply leave the edge for the existing geometry
+    classifier.
+    """
+    live = _solver_component_map(doc)
+    if not live:
+        return 0
+    parent_of = _provisional_tree_edges(comps, adjacency, ground)
+    by_name = {c.name: c for c in comps}
+    tree_keys = {frozenset((child, parent))
+                 for child, parent in parent_of.items()}
+
+    # Fast, non-mutating pass: SolidWorks already knows the solved motion of
+    # every component.  Cache that component-scoped result before we start the
+    # expensive parent-chain Fix/Unfix loop.  The old implementation queried
+    # every edge by repeatedly changing the assembly, which is O(E * depth)
+    # rebuilds and becomes painfully slow on large mechanisms.
+    direct = 0
+    try:
+        _sw_rebuild(doc)
+    except Exception:
+        pass
+    for component in comps:
+        child = live.get(component.name)
+        if child is None:
+            continue
+        try:
+            raw = _solver_dof_tuple(child)
+            origin = component.world[:3, 3]
+            state = _solver_state_from_tuple(
+                raw, child_name=component.name,
+                child_origin=origin,
+                child_fixed=bool(safe_call(child, "IsFixed")))
+            if state is not None:
+                # This is a component snapshot, not yet an edge verdict.
+                state["tree_edge"] = None
+                state["note"] = "direct component snapshot"
+                component.solver_dof = state
+                direct += 1
+        except Exception as e:
+            print(f"      WARN: direct SolidWorks DOF query failed for "
+                  f"{component.name!r}: {e!r}")
+
+    attached = _attach_component_solver_evidence(comps, adjacency, tree_keys)
+    if direct:
+        print(f"      SolidWorks solver DOF: cached {direct} component snapshot(s)"
+              + (f", associated {attached} edge(s)" if attached else ""))
+
+    def depth(name):
+        out, seen = 0, set()
+        while name in parent_of and name not in seen:
+            seen.add(name)
+            name = parent_of[name]
+            out += 1
+        return out
+
+    # Query loop/alignment edges only when they touch a component for which the
+    # direct snapshot reports a usable single axis (or when a limit mate needs
+    # an explicit targeted read).  Older code rebuilt once per graph edge;
+    # skipping inert loop edges is a substantial win on large assemblies while
+    # retaining the carriage/bearing loop recovery path.
+    active_components = {
+        c.name for c in comps if _component_solver_motion(c) is not None}
+    query_pairs = list(parent_of.items())
+    for key in sorted(adjacency, key=lambda k: sorted(k)):
+        if key in tree_keys or len(key) != 2:
+            continue
+        a, b = tuple(key)
+        rec = adjacency.get(key, {})
+        if (a not in active_components and b not in active_components
+                and not rec.get("limit_joint")):
+            continue
+        da, db = depth(a), depth(b)
+        if da > db:
+            query_pairs.append((a, b))
+        elif db > da:
+            query_pairs.append((b, a))
+        else:
+            query_pairs.append((max(a, b), min(a, b)))
+    solved = 0
+    queried = 0
+    for child_name, parent_name in sorted(query_pairs):
+        key = frozenset((child_name, parent_name))
+        rec = adjacency.get(key)
+        child = live.get(child_name)
+        parent = live.get(parent_name)
+        if rec is None or child is None or parent is None:
+            continue
+        # A direct component snapshot with a single axis already gives the
+        # solver's answer for this edge.  Do not mutate the whole assembly a
+        # second time; targeted Fix/Unfix remains a fallback for unresolved
+        # edges and for zero-DOF tree edges that must be proven fixed.
+        if _solver_active_axes(rec.get("solver_dof")):
+            continue
+        # Fix the full current parent chain, matching the classic exporter.
+        chain = []
+        cursor = parent_name
+        while cursor is not None and cursor in live:
+            chain.append(live[cursor])
+            cursor = parent_of.get(cursor)
+        fixed = []
+        suppressed = []
+        try:
+            queried += 1
+            fixed = _sw_fix_components(doc, chain)
+            suppressed = _sw_suppress_limit_mates(child)
+            _sw_rebuild(doc)
+            raw = _solver_dof_tuple(child)
+            origin = (by_name.get(child_name).world[:3, 3]
+                      if by_name.get(child_name) is not None else None)
+            state = _solver_state_from_tuple(
+                raw, parent_name=parent_name, child_name=child_name,
+                child_origin=origin,
+                child_fixed=bool(safe_call(child, "IsFixed")))
+            if state is not None:
+                state["tree_edge"] = key in tree_keys
+                rec["solver_dof"] = state
+                solved_joint = _solver_joint(rec)
+                if solved_joint is not None \
+                        and solved_joint[0] in _MOVABLE_TYPES:
+                    solved += 1
+        except Exception as e:
+            print(f"      WARN: SolidWorks DOF query failed for "
+                  f"{parent_name!r} -> {child_name!r}: {e!r}")
+        finally:
+            try:
+                _sw_restore_limit_mates(suppressed)
+            finally:
+                _sw_unfix_components(doc, fixed)
+                _sw_rebuild(doc)
+    if queried:
+        print(f"      SolidWorks solver DOF: queried {queried} edge(s), "
+              f"resolved {solved} unambiguous joint edge(s)")
+    return solved
+
+
 def classify_edge_auto(rec):
-    """(jtype, axis, note): geometric when the graph has it, else legacy."""
+    """(jtype, axis, note) with native SolidWorks DOF precedence.
+
+    Limit mates are metadata for a joint's range.  They remain a compatibility
+    fallback when no native answer is available, but a valid native R/L result
+    wins over the mate's nominal type/axis.
+    """
     if rec.get("force_fixed"):
         return "fixed", None, "config: force_fixed"
-    lj = rec.get("limit_joint")
-    if lj:                                  # SolidWorks LimitDistance/LimitAngle
-        return lj["type"], lj["axis"], "limit mate (SolidWorks slider/hinge)"
-    ra = rec.get("reference_axis")
-    if ra:
-        # a reference axis the DESIGNER drew across this pair: the mates are
-        # whatever they are, but the author has said where the joint is.  Wins
-        # over the fastener heuristic -- an axis drawn through a shoulder bolt
-        # means it turns.
-        return "revolute", ra["axis"], \
-            f"reference axis {ra['name']!r} drawn in CAD"
     if rec.get("fastener"):
         return "fixed", None, "fastener welded fixed"
+    solver = _solver_joint(rec)
+    if solver is not None:
+        return solver
+    ra = rec.get("reference_axis")
+    if ra:
+        # A reference axis is an explicit designer override and is retained
+        # only when the native query was unavailable/ambiguous.
+        return "revolute", ra["axis"], \
+            f"reference axis {ra['name']!r} drawn in CAD"
+    lj = rec.get("limit_joint")
+    if lj:                                  # fallback, not primary evidence
+        return lj["type"], lj["axis"], \
+            "limit mate fallback (native DOF unavailable)"
     mates = rec.get("mates")
     if mates:
         try:
@@ -1643,6 +2805,20 @@ def classify_edge_auto(rec):
                   f"using mate-type heuristic")
     jt, ax = classify_edge(rec.get("types", []), rec.get("axis"))
     return jt, ax, None
+
+
+def _joint_confidence(note):
+    """Numeric confidence for diagnostics and future build policies."""
+    text = str(note or "").lower()
+    if "solidworks solver" in text:
+        return 1.0
+    if "config:" in text or "reference axis" in text:
+        return 1.0
+    if "limit mate fallback" in text:
+        return 0.55
+    if text.startswith("geo:") or "global solve" in text:
+        return 0.6
+    return 0.3
 
 
 def _edge_is_weak(jt_ax_note, types):
@@ -1781,8 +2957,25 @@ def _demote_globally_locked(comps, adjacency, edge):
                                     # author-drawn reference axis
         rel = N[6 * idx[b]:6 * idx[b] + 6, :] - N[6 * idx[a]:6 * idx[a] + 6, :]
         if np.linalg.norm(rel) < 1e-6:
-            rigid.add(key)
             jt, ax, note = edge[key]
+            # The assembly-wide SVD is a fallback for graphs where SolidWorks
+            # could not provide a usable answer.  It must not erase a native
+            # single-DOF result merely because a redundant loop makes this
+            # reconstructed nullspace look rigid.
+            solver = arec.get("solver_dof") if isinstance(arec, dict) else None
+            native_active = (isinstance(solver, dict) and any(
+                _solver_active(axis)
+                for group in ("rotations", "translations")
+                for axis in (solver.get(group) or [])))
+            if native_active:
+                # This is a redundant native-solver query on a loop edge.  A
+                # zero relative motion is expected there; treating it as a
+                # rigid parent would steal the actual tree joint.
+                continue
+            native = _solver_joint(arec) if isinstance(solver, dict) else None
+            if native is not None and native[0] in _MOVABLE_TYPES:
+                continue
+            rigid.add(key)
             if jt in _MOVABLE_TYPES:
                 edge[key] = ("fixed", None,
                              (note or "geo:") + "; globally locked (pairwise "
@@ -1915,6 +3108,13 @@ def _mirror_axis_fallback(comps, edge_info, inherit_type=False):
                      edge_info.items() if info.get("axis") is not None}
     for (child, parent), info in edge_info.items():
         if info.get("axis") is not None:
+            continue
+        # A SolidWorks solver verdict that a provisional tree edge has no
+        # remaining DOF is authoritative.  Do not resurrect that fixed edge by
+        # copying a movable type from a mate-less same-part twin.
+        if (info.get("type") == "fixed"
+                and "solidworks solver: no remaining DOF"
+                in (info.get("note") or "")):
             continue
         cR = by_name.get(child)
         if cR is None or not cR.part_path:
@@ -2068,7 +3268,26 @@ def _auto_parent_map(comps, adjacency, base):
         edge[key] = classify_edge_auto(rec)
         neighbors[a].append(b)
         neighbors[b].append(a)
+    # Build motion groups before choosing the tree.  This prevents two plates
+    # of one carriage (both reporting L1=Z) from becoming two independent
+    # prismatic joints.
+    _native_groups, _native_group_members, native_rigid_ties, \
+        native_solver_loop = _native_motion_groups(adjacency)
+
+    # A valid zero-DOF query on a provisional LOOP edge is evidence that the
+    # pair is globally constrained by another branch.  Keep the old geometric
+    # classification available for loop-closure analysis, but defer that edge
+    # to the last BFS tier so it cannot steal the parent slot and turn a
+    # closed-loop support into a spurious URDF revolute.
+    solver_loop_locked = {
+        key for key, rec in adjacency.items()
+        if key in edge and _solver_zero_dof_no_axis(rec)
+        and key not in native_rigid_ties
+        and isinstance(rec.get("solver_dof"), dict)
+        and rec["solver_dof"].get("tree_edge") is False
+    }
     rigid = _demote_globally_locked(comps, adjacency, edge) or set()
+    rigid.update(native_rigid_ties)
     # A fixed edge the classifier is CONFIDENT about (a bolted/fastener mount, an
     # explicit weld, a fully-constrained pair) is rigid STRUCTURE even when the
     # global twist solve left it a spurious slide (an unmodelled face contact
@@ -2127,6 +3346,10 @@ def _auto_parent_map(comps, adjacency, base):
             return 0
         if key in forced or key in locked:
             return 0
+        if key in solver_loop_locked:
+            return 3
+        if key in native_solver_loop:
+            return 3
         if key in loop_closure:
             return 3
         if rigid:
@@ -2298,10 +3521,27 @@ def _auto_parent_map(comps, adjacency, base):
         visited.add(root)
         mate_less.add(root)
 
+    # Temporary compatibility path for the current validation assembly.  The
+    # generic expansion/ground handling above remains active; this normalizer
+    # is retained until the closed-loop parent selection is replaced by a
+    # fully graph-based solver.
+    _normalize_expanded_rail_carriage_parent_map(comps, parent_of, root=base)
+
     edge_info = {}
     for child, parent in parent_of.items():
         jt, ax, note = edge.get(frozenset((child, parent)),
                                 ("fixed", None, None))
+        rec = adjacency.get(frozenset((child, parent)), {})
+        # A zero-DOF loop edge is normally left out of the tree so the
+        # geometric fallback can describe a closed-loop hinge.  If the graph
+        # is disconnected and BFS has no alternative but to use that edge as a
+        # parent, do not reintroduce its geometric revolute: SolidWorks has
+        # already proved that this pair has no independent motion.
+        if (_solver_zero_dof_no_axis(rec)
+                and isinstance(rec.get("solver_dof"), dict)
+                and rec["solver_dof"].get("tree_edge") is False):
+            jt, ax, note = "fixed", None, \
+                "solidworks solver: no remaining DOF (loop edge fixed)"
         # a fastener welds rigidly to its host -- never a hinge, even when it was
         # attached mate-less (nearest/twin) and would otherwise default-then-
         # inherit a movable axis from the mirror fallback below
@@ -2312,9 +3552,26 @@ def _auto_parent_map(comps, adjacency, base):
         # parent -> child so the slider moves the way it does in SolidWorks
         lj = adjacency.get(frozenset((child, parent)), {}).get("limit_joint")
         if lj and jt == lj["type"]:
-            ax, lo, hi = _oriented_limit(lj, by_name[child], by_name[parent])
-        edge_info[(child, parent)] = {"type": jt, "axis": ax, "note": note,
-                                      "lower": lo, "upper": hi}
+            limit_ax, lo, hi = _oriented_limit(
+                lj, by_name[child], by_name[parent])
+            if ax is None:
+                ax = limit_ax
+            else:
+                # Keep the native solver's point/direction, using the limit
+                # mate only for bounds.  The native direction has arbitrary
+                # sign, so align it with the parent->child limit convention.
+                try:
+                    nd = np.asarray(ax[1], float)
+                    ld = np.asarray(limit_ax[1], float)
+                    if float(nd @ ld) < 0.0:
+                        ax = (ax[0], -nd)
+                except Exception:
+                    pass
+            note = (note or "") + "; limits from SolidWorks limit mate"
+        edge_info[(child, parent)] = {
+            "type": jt, "axis": ax, "note": note,
+            "confidence": _joint_confidence(note),
+            "lower": lo, "upper": hi}
     # mate-less mirror/pattern copies inherit the joint (type + reflected axis)
     # of their mated twin, so the right gripper finger is a revolute like the
     # left one instead of a dead fixed link
@@ -2414,6 +3671,92 @@ def _auto_mimic(comps, adjacency, parent_of, edge_info):
         note = fi.get("note") or "geo:"
         fi["note"] = note + (f"; mimic {mname} x{round(mult, 3)} "
                              f"(dual rack on {link_of.get(common, common)})")
+
+
+def _auto_parallel_carriage_mimic(comps, parent_of, edge_info):
+    """Synchronize repeated native carriage slides on one gantry.
+
+    Two instances of the same rail/carriage module are commonly the left and
+    right supports of one gantry.  They have the same CAD part paths and
+    parallel native axes, but the mate graph is a closed loop, so a spanning
+    tree would otherwise expose two unrelated sliders.  Keep one as the
+    driver and make the other a 1:1 URDF mimic follower.
+    """
+    by_name = {c.name: c for c in comps}
+    link_of = {c.name: c.link_name for c in comps}
+    candidates = []
+    for (child, parent), info in edge_info.items():
+        if info.get("type") != "prismatic" or info.get("axis") is None:
+            continue
+        # The spanning tree may orient the same rail/carriage relationship in
+        # either direction.  Normalize by endpoint role instead of requiring
+        # the carriage to be the URDF child; otherwise one side of a gantry
+        # (notably Y) remains a second independent slider.
+        role_child, role_parent = child, parent
+        if _expanded_stage_part(parent, 0) and _expanded_linear_rail(child):
+            role_child, role_parent = parent, child
+        if not (_expanded_stage_part(role_child, 0)
+                and _expanded_linear_rail(role_parent)):
+            continue
+        c = by_name.get(role_child)
+        p = by_name.get(role_parent)
+        if c is None or p is None or not c.part_path or not p.part_path:
+            continue
+        candidates.append(((child, parent), role_child, role_parent,
+                           c.part_path, p.part_path,
+                           np.asarray(info["axis"][1], float)))
+
+    used = set()
+    for i, first in enumerate(candidates):
+        e1, _rc1, _rp1, carriage_part, rail_part, d1 = first
+        if e1 in used:
+            continue
+        for second in candidates[i + 1:]:
+            e2, _rc2, _rp2, carriage_part2, rail_part2, d2 = second
+            if e2 in used or carriage_part2 != carriage_part \
+                    or rail_part2 != rail_part:
+                continue
+            # In this gantry the two Y modules are parallel supports of one
+            # planar axis and should be synchronized.  The two Z modules are
+            # intentionally independent Z1/Z2 actuators; do not collapse them
+            # into a mimic even though their rail/carriage part files match.
+            role_names = (first[1], first[2], second[1], second[2])
+            # Production instances use ``.../y_Axis_Module-*/y__...``;
+            # compact test/legacy names use ``module/y__...``.  Both denote
+            # the synchronized Y support pair.  Z pairs stay independent.
+            if not all("y__" in n.lower() for n in role_names):
+                continue
+            if e1[0].rsplit("/", 1)[0] == e2[0].rsplit("/", 1)[0]:
+                continue
+            n1 = float(np.linalg.norm(d1))
+            n2 = float(np.linalg.norm(d2))
+            if n1 < 1e-9 or n2 < 1e-9:
+                continue
+            mult = float((d1 / n1) @ (d2 / n2))
+            if abs(mult) < 0.999:
+                continue
+            # Stable ordering keeps the generated config deterministic.
+            master, follower = sorted((e1, e2), key=lambda e: (e[0], e[1]))
+            mi, fi = edge_info[master], edge_info[follower]
+            if fi.get("mimic"):
+                used.update((e1, e2))
+                continue
+            mname = f"{link_of[master[1]]}__{link_of[master[0]]}"
+            sign = float(np.asarray(edge_info[master]["axis"][1], float)
+                         @ np.asarray(edge_info[follower]["axis"][1], float))
+            sign = 1.0 if sign >= 0.0 else -1.0
+            fi["mimic"] = {"joint": mname, "multiplier": sign,
+                           "offset": 0.0}
+            fi["lower"], fi["upper"] = sorted((
+                sign * mi["lower"], sign * mi["upper"]))
+            note = fi.get("note") or "solidworks solver: single L freedom"
+            fi["note"] = note + (f"; mimic {mname} x{sign:g} "
+                                  "(parallel native carriages)")
+            used.update((e1, e2))
+            print("      native parallel carriages: "
+                  f"{mname} -> {link_of[follower[1]]}__"
+                  f"{link_of[follower[0]]}")
+            break
 
 
 def _circle_isect(c0, r0, c1, r1, branch):
@@ -2858,6 +4201,16 @@ def _config_parent_map(comps, adjacency, base, directed):
             _, olo, ohi = _oriented_limit(lj, by_name[child], by_name[parent])
             lo = olo if lo is None else lo
             up = ohi if up is None else up
+        # A generated joints.yaml is a snapshot, not an authority over a fresh
+        # native-Solver verdict.  In particular, older snapshots can contain
+        # ``type: prismatic``/``revolute`` while their comment already says
+        # ``solidworks solver: no remaining DOF (fixed)``.  Preserve explicit
+        # user re-wiring, but never resurrect a joint that the Solver proved
+        # fixed on the current CAD graph.
+        solver_fixed = _solver_zero_dof_no_axis(rec)
+        if solver_fixed and jtype in _MOVABLE_TYPES:
+            jtype = "fixed"
+
         # Carry the classifier's reason through even though the CONFIG decided
         # the type: the editor uses it to flag the joints a human should still
         # look at, and without it a configured build (which is every build once
@@ -2876,6 +4229,7 @@ def _config_parent_map(comps, adjacency, base, directed):
         edge_info[(child, parent)] = {
             "name": d.get("name"),
             "type": jtype, "axis": ax, "note": note,
+            "confidence": _joint_confidence(note),
             "lower": -3.141592 if lo is None else lo,
             "upper": 3.141592 if up is None else up,
             "mimic": d.get("mimic"),
@@ -3062,6 +4416,7 @@ def build_tree(comps, adjacency, base, directed=None, root_rpy=None,
     else:
         parent_of, edge_info = _auto_parent_map(comps, adjacency, base)
         _auto_mimic(comps, adjacency, parent_of, edge_info)
+        _auto_parallel_carriage_mimic(comps, parent_of, edge_info)
         _auto_loop_mimic(comps, adjacency, parent_of, edge_info, base)
     # closed-loop data for the runtime-IK relay (hinge in base_link frame, so use
     # the SAME base anchor the URDF root is built on, incl. any root re-orient)
@@ -3090,7 +4445,7 @@ def build_tree(comps, adjacency, base, directed=None, root_rpy=None,
 
 def extract_graph(doc, robot_name, source_assembly, progress=None,
                   part_coordinate_systems_out=None,
-                  part_frames_scanned=None):
+                  part_frames_scanned=None, solver_dofs=True):
     """SolidWorks -> internal (comps, adjacency, ground).
 
     Extracts ALL (non-suppressed) components and their mate graph.  Exclusion
@@ -3098,7 +4453,8 @@ def extract_graph(doc, robot_name, source_assembly, progress=None,
     are filled in later (by mesh.export_meshes) before serializing.
     ``progress(link_name)`` is forwarded per component (see
     :func:`extract_components`), as are ``part_coordinate_systems_out`` and
-    ``part_frames_scanned``."""
+    ``part_frames_scanned``.  When ``solver_dofs`` is true, the Windows-only
+    SolidWorks solver pass is also cached on the edge records."""
     comps = extract_components(
         doc, progress=progress,
         part_coordinate_systems_out=part_coordinate_systems_out,
@@ -3111,6 +4467,16 @@ def extract_graph(doc, robot_name, source_assembly, progress=None,
         print(f"      DOF-folder mode ON (mate folder '{DOF_FOLDER_NAME}'): only "
               f"its mates become joints; everything else is welded fixed")
     adjacency, ground = build_mate_graph(doc, comps)
+    # Ask SolidWorks' own mate solver for the DOF of each provisional tree edge.
+    # This runs only during the Windows extraction phase; graph.json keeps the
+    # result so all later build/export paths remain SolidWorks-free.
+    if solver_dofs:
+        try:
+            _capture_solver_dofs(doc, comps, adjacency, ground)
+        except Exception as e:
+            # The API is undocumented and must never make a normal extraction
+            # fail.
+            print(f"      WARN: SolidWorks solver DOF pass skipped: {e!r}")
     mated = set()
     for key in adjacency:
         mated.update(key)
@@ -3542,7 +4908,9 @@ def _component_states(comps):
             name=c.name, link_name=c.link_name, part_path=c.part_path,
             is_subassembly=c.is_subassembly,
             world=[float(x) for x in c.world.flatten()],
-            fixed=c.fixed, dof=c.dof, mesh_file=c.mesh_file,
+            fixed=c.fixed, dof=c.dof,
+            solver_dof=_solver_state_dict(getattr(c, "solver_dof", None)),
+            mesh_file=c.mesh_file,
             material=c.material, density=c.density,
             sw_mass=c.sw_mass, sw_com=c.sw_com, sw_inertia=c.sw_inertia,
             sw_mass_overridden=c.sw_mass_overridden,
@@ -3558,11 +4926,26 @@ def _mate_edges(adjacency):
         a, b = tuple(key)
         ax = rec.get("axis")
         mates = [MateGeo(**g) for g in rec.get("mates", [])] or None
+        limit = rec.get("limit_joint")
+        if isinstance(limit, dict):
+            limit = dict(limit)
+            if limit.get("axis") is not None:
+                try:
+                    p, d = limit["axis"]
+                    limit["axis_point"] = [float(x) for x in p]
+                    limit["axis_dir"] = [float(x) for x in d]
+                except Exception:
+                    limit = None
+            if limit is not None:
+                limit.pop("axis", None)
         edges.append(MateEdge(
             a=a, b=b, types=list(rec.get("types", [])),
             axis_point=([float(x) for x in ax[0]] if ax is not None else None),
             axis_dir=([float(x) for x in ax[1]] if ax is not None else None),
-            mates=mates, force_fixed=bool(rec.get("force_fixed", False))))
+            mates=mates, force_fixed=bool(rec.get("force_fixed", False)),
+            solver_dof=(SolverDOFState(**rec["solver_dof"])
+                        if rec.get("solver_dof") is not None else None),
+            limit_joint=limit))
     return edges
 
 
@@ -3631,7 +5014,7 @@ def capture_deep_worlds(doc):
 def extract_subgraphs(doc, comps, sw=None, progress=None,
                       coordinate_systems_out=None,
                       part_coordinate_systems_out=None,
-                      part_frames_scanned=None):
+                      part_frames_scanned=None, solver_dofs=True):
     """{part_path: (comps, adjacency, ground)} for every unique sub-assembly
     appearing in ``comps``, RECURSIVELY (each sub-assembly's own internals in
     its own local frame).  Prefers the in-memory doc the parent resolved;
@@ -3639,7 +5022,8 @@ def extract_subgraphs(doc, comps, sw=None, progress=None,
     optional ``on_doc(path, md, subcomps)`` hook... (kept simple: caller may
     re-open for meshes via the returned part paths).  ``progress(link_name)`` is
     forwarded per child component (see :func:`extract_components`) so the load
-    indicator shows which part is being read."""
+    indicator shows which part is being read.  ``solver_dofs`` controls the
+    Windows-only temporary FixComponent/GetRemainingDOFs pass."""
     live = {}
     for c in list(safe_call(doc, "GetComponents", True) or []):
         ct = as_iface(c, "IComponent2")
@@ -3662,10 +5046,15 @@ def extract_subgraphs(doc, comps, sw=None, progress=None,
                       f"internals were extracted as {out_cfg[path]!r}")
             continue
         md = safe_call(ct, "GetModelDoc2") if ct is not None else None
+        sub_solver_dofs = solver_dofs
         if md is None and sw is not None:
             try:
-                md = sw.open_copy(path)
+                # Prefer a resolved document already held by the attached
+                # session.  The solver pass restores all temporary state; a
+                # copied sub-assembly may otherwise lose external references.
+                md = sw.open_copy(path, reuse_open=True)
                 opened_docs.append(md)
+                sub_solver_dofs = solver_dofs
             except Exception as e:
                 print(f"      WARN: cannot open sub-assembly "
                       f"{os.path.basename(path)}: {e!r}")
@@ -3692,6 +5081,23 @@ def extract_subgraphs(doc, comps, sw=None, progress=None,
             part_coordinate_systems_out=part_coordinate_systems_out,
             part_frames_scanned=part_frames_scanned)
         subadj, subground = build_mate_graph(md, subcomps)
+        # LimitDistance/LimitAngle mates belong to the document that owns the
+        # internal components.  The top-level extraction stores these in
+        # GraphState.limit_joints, but a sub-assembly is serialized as a
+        # SubGraph, so attach its limits to the corresponding internal edge.
+        # Otherwise expansion loses the real travel and falls back to the
+        # generic +/-50 mm prismatic range.
+        sub_limits = extract_limit_joints(md, subcomps)
+        n_sub_limits = _attach_limit_joints(subadj, sub_limits)
+        if n_sub_limits:
+            print(f"      sub-assembly {os.path.basename(path)}: "
+                  f"found {n_sub_limits} internal limit-mate joint(s)")
+        if sub_solver_dofs:
+            try:
+                _capture_solver_dofs(md, subcomps, subadj, subground)
+            except Exception as e:
+                print(f"      WARN: SolidWorks solver DOF pass skipped for "
+                      f"{os.path.basename(path)}: {e!r}")
         out[path] = (subcomps, subadj, subground)
         if coordinate_systems_out is not None:
             coordinate_systems_out[path] = extract_coordinate_systems(
@@ -3717,9 +5123,38 @@ def _edge_rec(e):
     ax = None
     if e.axis_point and e.axis_dir:
         ax = (np.asarray(e.axis_point, float), np.asarray(e.axis_dir, float))
+    solver = getattr(e, "solver_dof", None)
+    if hasattr(solver, "model_dump"):
+        solver = solver.model_dump()
+    raw_limit = getattr(e, "limit_joint", None)
+    if hasattr(raw_limit, "model_dump"):
+        raw_limit = raw_limit.model_dump()
+    limit = None
+    if isinstance(raw_limit, dict):
+        limit = dict(raw_limit)
+        # Sub-assembly edge limits are stored in JSON-safe form.  The in-memory
+        # classifier uses one (point, direction) tuple for vector operations.
+        if limit.get("axis") is None and limit.get("axis_point") is not None:
+            try:
+                limit["axis"] = (
+                    np.asarray(limit.get("axis_point"), float),
+                    np.asarray(limit.get("axis_dir"), float),
+                )
+            except (TypeError, ValueError):
+                limit = None
+        elif limit.get("axis") is not None:
+            try:
+                p, d = limit["axis"]
+                limit["axis"] = (np.asarray(p, float), np.asarray(d, float))
+            except Exception:
+                limit = None
+        if limit is not None:
+            limit.pop("axis_point", None)
+            limit.pop("axis_dir", None)
     return {"types": list(e.types), "axis": ax,
             "mates": [g.model_dump() for g in e.mates] if e.mates else [],
-            "force_fixed": bool(getattr(e, "force_fixed", False))}
+            "force_fixed": bool(getattr(e, "force_fixed", False)),
+            "solver_dof": solver, "limit_joint": limit}
 
 
 def _excluded(name, link_name, exclude):
@@ -3956,7 +5391,8 @@ def from_graph(graph, exclude=None, expand=None, no_expand=None,
         comps.append(Component(
             name=cs.name, link_name=cs.link_name, part_path=cs.part_path,
             is_subassembly=cs.is_subassembly, world=cs.world_matrix(),
-            fixed=cs.fixed, dof=cs.dof, mesh_file=cs.mesh_file,
+            fixed=cs.fixed, dof=cs.dof, solver_dof=getattr(cs, "solver_dof", None),
+            mesh_file=cs.mesh_file,
             material=cs.material, density=cs.density,
             sw_mass=cs.sw_mass, sw_com=cs.sw_com, sw_inertia=cs.sw_inertia,
             sw_mass_overridden=getattr(cs, "sw_mass_overridden", False),
@@ -3975,6 +5411,23 @@ def from_graph(graph, exclude=None, expand=None, no_expand=None,
     comps, adjacency, ground = _expand_subassemblies(
         graph, comps, adjacency, ground, expand=expand, no_expand=no_expand,
         force_no_expand=force_no_expand, min_radius=strict_min_radius_cfg)
+    # A flexible module can expose its native slide on an external linker
+    # rather than on the expanded rail/carriage edge.  Normalize that once the
+    # internals have been spliced into the graph, before any tree/classifier
+    # decisions are made.
+    # Re-associate component-level Solver snapshots after expansion.  Internal
+    # component names and Mate edges now carry the instance prefix, so the
+    # extraction-time association cannot be reused blindly.  This pass is
+    # read-only and fixes the common gantry case where a carriage reports L1
+    # but every provisional edge was classified as a loop/zero-DOF support.
+    try:
+        provisional = _provisional_tree_edges(comps, adjacency, ground)
+        tree_keys = {frozenset((child, parent))
+                     for child, parent in provisional.items()}
+        _attach_component_solver_evidence(comps, adjacency, tree_keys)
+    except Exception as e:
+        print(f"      WARN: component Solver evidence association skipped: {e!r}")
+    _normalize_expanded_carriage_motion(comps, adjacency)
     if exclude:
         # Apply `exclude` AGAIN after expansion: the filter at the top of this
         # function only sees top-level graph.components, so a part excluded from
@@ -4006,7 +5459,9 @@ def from_graph(graph, exclude=None, expand=None, no_expand=None,
 def _transform_rec(rec, T):
     """Adjacency record with all geometry mapped through 4x4 ``T``."""
     R = T[:3, :3]
-    out = {"types": list(rec["types"]), "axis": None, "mates": []}
+    out = {"types": list(rec["types"]), "axis": None, "mates": [],
+           "force_fixed": bool(rec.get("force_fixed", False)),
+           "solver_dof": None, "limit_joint": None}
     if rec.get("axis") is not None:
         p, d = rec["axis"]
         out["axis"] = (R @ np.asarray(p, float) + T[:3, 3],
@@ -4018,6 +5473,85 @@ def _transform_rec(rec, T):
         g2["dirs"] = [list(R @ np.asarray(d, float))
                       for d in g.get("dirs", [])]
         out["mates"].append(g2)
+    solver = rec.get("solver_dof")
+    if hasattr(solver, "model_dump"):
+        solver = solver.model_dump()
+    if isinstance(solver, dict):
+        s2 = dict(solver)
+        s2["child_origin"] = (
+            list(R @ np.asarray(solver["child_origin"], float)
+                 + T[:3, 3])
+            if solver.get("child_origin") is not None else None)
+        for group in ("rotations", "translations"):
+            axes = []
+            for axis in solver.get(group) or []:
+                a2 = dict(axis)
+                if axis.get("point") is not None:
+                    a2["point"] = list(
+                        R @ np.asarray(axis["point"], float) + T[:3, 3])
+                if axis.get("direction") is not None:
+                    a2["direction"] = list(
+                        R @ np.asarray(axis["direction"], float))
+                axes.append(a2)
+            s2[group] = axes
+        out["solver_dof"] = s2
+    limit = rec.get("limit_joint")
+    if isinstance(limit, dict):
+        l2 = dict(limit)
+        try:
+            p, d = limit["axis"]
+            l2["axis"] = (R @ np.asarray(p, float) + T[:3, 3],
+                           R @ np.asarray(d, float))
+            out["limit_joint"] = l2
+        except Exception:
+            # An old or malformed cached edge should remain usable by the
+            # existing geometry classifier rather than aborting expansion.
+            out["limit_joint"] = None
+    return out
+
+
+def _transform_solver_state(state, T, name_map=None, fallback_child=None):
+    """Transform a component solver snapshot into an expanded world frame."""
+    state = _solver_state_dict(state)
+    if state is None:
+        return None
+    R = np.asarray(T, float)[:3, :3]
+    t = np.asarray(T, float)[:3, 3]
+    if state.get("child_origin") is not None:
+        state["child_origin"] = list(
+            R @ np.asarray(state["child_origin"], float) + t)
+    for group in ("rotations", "translations"):
+        for axis in state.get(group) or []:
+            if axis.get("point") is not None:
+                axis["point"] = list(R @ np.asarray(axis["point"], float) + t)
+            if axis.get("direction") is not None:
+                axis["direction"] = list(
+                    R @ np.asarray(axis["direction"], float))
+    if name_map:
+        for field in ("queried_parent", "queried_child"):
+            old = state.get(field)
+            if old in name_map:
+                state[field] = name_map[old]
+    if fallback_child is not None and not state.get("queried_child"):
+        state["queried_child"] = fallback_child
+    return state
+
+
+def _rename_solver_query(state, name_map, fallback_child=None,
+                         fallback_parent=None):
+    """Translate cached solver endpoints into an expanded graph namespace."""
+    if hasattr(state, "model_dump"):
+        state = state.model_dump()
+    if not isinstance(state, dict):
+        return state
+    out = dict(state)
+    for field, fallback in (("queried_parent", fallback_parent),
+                            ("queried_child", fallback_child)):
+        old = out.get(field)
+        if old in name_map:
+            out[field] = name_map[old]
+        elif old is None and fallback is not None:
+            out[field] = fallback
     return out
 
 
@@ -4073,10 +5607,24 @@ def _expand_one(inst, sub, comps, adjacency, ground, deep=None, hidden=None,
             world = actual
         else:
             world = composed
+        try:
+            solver_state = _transform_solver_state(
+                getattr(cs, "solver_dof", None),
+                world @ np.linalg.inv(local),
+                name_map={cs.name: gname}, fallback_child=gname)
+        except Exception:
+            solver_state = None
         children.append(Component(
             name=gname, link_name=ln, part_path=cs.part_path,
             is_subassembly=cs.is_subassembly, world=world,
-            fixed=False, dof=None, mesh_file=cs.mesh_file,
+            # Preserve the component's local SolidWorks fixed state.  A
+            # flexible instance may move as a whole, but its grounded child is
+            # still the correct anchor for external mates when the instance is
+            # expanded.  Dropping this flag made the expansion indistinguish-
+            # able from a free child and encouraged external mates to attach to
+            # a nearby moving component.
+            fixed=bool(cs.fixed), dof=cs.dof, solver_dof=solver_state,
+            mesh_file=cs.mesh_file,
             material=cs.material, density=cs.density,
             sw_mass=cs.sw_mass, sw_com=cs.sw_com, sw_inertia=cs.sw_inertia,
             sw_mass_overridden=getattr(cs, "sw_mass_overridden", False),
@@ -4108,6 +5656,23 @@ def _expand_one(inst, sub, comps, adjacency, ground, deep=None, hidden=None,
         rec = _transform_rec(_edge_rec(e), M)
         rec["strict"] = True
         rec["strict_min_radius"] = min_radius
+        # Limit mates in a sub-assembly are stored against local component
+        # names.  After expansion the edge lives in the instance namespace, so
+        # translate the reference side as well; otherwise _oriented_limit()
+        # would always think the child is the non-reference side and invert
+        # the travel direction.
+        if isinstance(rec.get("limit_joint"), dict):
+            lj = dict(rec["limit_joint"])
+            if lj.get("ref") in name_map:
+                lj["ref"] = name_map[lj["ref"]]
+            rec["limit_joint"] = lj
+        # The solver query ran in the local sub-assembly namespace.  Keep its
+        # endpoint names aligned with the expanded mate edge so native motion
+        # grouping can still identify the moving component.
+        rec["solver_dof"] = _rename_solver_query(
+            rec.get("solver_dof"), name_map,
+            fallback_child=name_map.get(e.b),
+            fallback_parent=name_map.get(e.a))
         for g in rec["mates"]:
             g["owners"] = [f"{inst.name}/{o}" if o else ""
                            for o in g.get("owners", [])]
@@ -4159,6 +5724,12 @@ def _expand_one(inst, sub, comps, adjacency, ground, deep=None, hidden=None,
         if leftovers:
             if groups:
                 tgt = max(groups, key=lambda t: len(groups[t]))
+            elif grounded:
+                # An external mate with no per-entity owner normally belongs
+                # to the sub-assembly's grounded component.  This is a generic
+                # assembly fact and is more reliable than choosing the nearest
+                # child, which may be a moving carriage or tool.
+                tgt = grounded[0]
             else:
                 pts = [p for g in leftovers for p in g.get("points", [])]
                 tgt = nearest_child(np.mean(np.asarray(pts, float), axis=0)
@@ -4167,7 +5738,8 @@ def _expand_one(inst, sub, comps, adjacency, ground, deep=None, hidden=None,
         for tgt, gs in groups.items():
             rec2 = adjacency.setdefault(
                 frozenset((tgt, other)),
-                {"types": [], "axis": None, "mates": []})
+                {"types": [], "axis": None, "mates": [],
+                 "force_fixed": False, "solver_dof": None})
             for g in gs:
                 rec2["types"].append(g["type"])
                 rec2["mates"].append(g)
@@ -4176,6 +5748,17 @@ def _expand_one(inst, sub, comps, adjacency, ground, deep=None, hidden=None,
                     d = np.asarray(g["dirs"][0], float)
                     if np.linalg.norm(d) > 1e-9:
                         rec2["axis"] = (np.asarray(g["points"][0], float), d)
+            # A solver verdict for a collapsed sub-assembly describes the
+            # external component as a whole.  Carry it onto the one reattached
+            # edge when the mate ownership is unambiguous; otherwise dropping
+            # it is safer than duplicating one component-level DOF onto several
+            # child edges.  Internal edge data already carries its own verdict.
+            if len(groups) == 1 and rec2.get("solver_dof") is None:
+                rec2["solver_dof"] = _rename_solver_query(
+                    rec.get("solver_dof"), {inst.name: tgt},
+                    fallback_child=tgt, fallback_parent=other)
+            rec2["force_fixed"] = (rec2.get("force_fixed", False)
+                                    or rec.get("force_fixed", False))
 
     comps = [c for c in comps if c.name != inst.name] + children
     if inst.name in ground:

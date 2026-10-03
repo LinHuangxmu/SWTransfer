@@ -25,6 +25,12 @@ class ComponentState(BaseModel):
     # model.is_fastener_part); persisted so an extract can also pre-tag it.
     is_fastener: bool = False
     dof: int | None = None
+    # Component-level snapshot from SolidWorks ``GetRemainingDOFs``.  This is
+    # deliberately separate from MateEdge.solver_dof: the API reports motion
+    # for a component in the solved assembly, not for one Mate.  Keeping the
+    # snapshot lets the build associate a carriage/bearing motion with the
+    # correct edge even when the Mate graph is dense or closed.
+    solver_dof: dict | None = None
     mesh_file: str | None = None    # relative path, e.g. "meshes/x.3dxml"
     material: str | None = None     # SolidWorks material name (e.g. "ABS")
     density: float | None = None    # kg/m^3 from that material
@@ -82,6 +88,45 @@ class MateGeo(BaseModel):
     owners: list[str] = []
 
 
+class SolverAxisState(BaseModel):
+    """One axis reported by SolidWorks ``GetRemainingDOFs``.
+
+    SolidWorks returns two possible rotational and two possible linear
+    freedoms.  The API is undocumented, so both status fields are persisted
+    together with the geometry instead of throwing them away after parsing.
+    Points/directions use the assembly/document frame in which the query ran.
+    """
+    status: int | None = None
+    direction_status: int | None = None
+    point: list[float] | None = None
+    direction: list[float] | None = None
+
+
+class SolverDOFState(BaseModel):
+    """Cached result of a Windows SolidWorks solver query for one edge."""
+    remaining_dofs: int | None = None
+    rotations: list[SolverAxisState] = []
+    translations: list[SolverAxisState] = []
+    queried_parent: str | None = None
+    queried_child: str | None = None
+    # ``GetRemainingDOFs`` returns code 2 for a component that SolidWorks has
+    # fixed.  Keep the component flag beside the raw code: a non-fixed,
+    # transiently unsolved component can also produce code 2, so the code is
+    # not sufficient by itself to classify an edge as fixed.
+    child_fixed: bool | None = None
+    # assembled child origin, used as the joint point for a pure translation
+    # (the SolidWorks API returns a direction but no point for L1/L2)
+    child_origin: list[float] | None = None
+    # Whether this edge belonged to the provisional parent tree used while the
+    # SolidWorks query was made.  A valid zero-DOF result is authoritative for
+    # a tree edge (it must be fixed); for a non-tree/closed-loop edge we retain
+    # the geometric fallback so an intended hinge can still be represented as
+    # a loop closure.  None keeps compatibility with older graph.json files.
+    tree_edge: bool | None = None
+    valid: bool = False
+    note: str | None = None
+
+
 class MateEdge(BaseModel):
     a: str                          # component Name2
     b: str
@@ -92,6 +137,17 @@ class MateEdge(BaseModel):
     mates: list[MateGeo] | None = None
     # DOF-folder mode: this edge is NOT a 'dof' joint -> weld it fixed at build
     force_fixed: bool = False
+    # SolidWorks' own solved DOF result, captured during Windows extraction.
+    # None is expected on older graph.json files and on edges for which the
+    # undocumented API could not be queried; those use the existing geometry
+    # classifier instead.
+    solver_dof: SolverDOFState | None = None
+    # A LimitDistance/LimitAngle found in a sub-assembly document.  Top-level
+    # limit mates are kept in GraphState.limit_joints for compatibility, but
+    # internal mates must travel with the edge so expansion can carry them into
+    # the parent graph.  The value is a JSON-safe mapping with
+    # ``type/ref/axis_point/axis_dir/lower/upper``.
+    limit_joint: dict | None = None
 
 
 class LimitJoint(BaseModel):

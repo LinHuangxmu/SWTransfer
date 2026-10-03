@@ -54,6 +54,7 @@ _TYPELIBS = {
 _TESTED_MAJOR = 32                  # SolidWorks 2024 (year - 1992); the verified one
 _ISSUES_URL = "https://github.com/iory/sw2robot/issues"
 _sld_module = None
+_swconst_module = None
 
 
 def _registered_typelib_versions(libid):
@@ -160,6 +161,7 @@ def _load_modules():
     None if it could not be loaded for any candidate version."""
     if gencache is None:
         return None
+    global _swconst_module
     mod = None
     for name, libid in _TYPELIBS.items():
         for major, minor in _version_candidates(libid):
@@ -170,8 +172,28 @@ def _load_modules():
             if m is not None:
                 if name == "sldworks":
                     mod = m
+                elif name == "swconst":
+                    _swconst_module = m
                 break                         # this typelib loaded; next typelib
     return mod
+
+
+def swconst_value(name, default=None):
+    """Return a SolidWorks ``swconst`` enum value when the typelib is loaded.
+
+    The extractor normally does not need constants, but the undocumented DOF
+    path temporarily suppresses mate features and therefore needs the enum
+    values for ``SetSuppression2``.  Keeping this lookup here lets the model
+    module remain importable on non-Windows machines and avoids pinning enum
+    numbers to one SolidWorks release.  ``default`` is returned when the
+    typelib is unavailable (for tests or a late-bound installation).
+    """
+    try:
+        ensure_typelibs()
+        value = getattr(_swconst_module, name)
+        return int(value)
+    except Exception:
+        return default
 
 
 def _makepy_solidworks():
@@ -498,7 +520,7 @@ class SolidWorks:
         return safe_call(self.app, "RevisionNumber") not in (None, "")
 
     # -- document handling ------------------------------------------------
-    def open_copy(self, path):
+    def open_copy(self, path, reuse_open=True):
         """Copy ``path`` to a temp dir and open the COPY full (read-write).
 
         We never open or modify the user's original file.  Crucially we do NOT
@@ -522,6 +544,10 @@ class SolidWorks:
                 f"{path} is a directory, not a .SLDASM/.SLDPRT file")
         import time as _time
         t0 = _time.time()
+        # This is per-open, not per-session.  An attached session may reuse one
+        # document and open a throw-away copy for the next request; callers use
+        # this flag to decide whether temporary solver edits are safe.
+        self._reused_open_doc = False
         doc = None
         # If the SAME assembly is already open in the user's reused session, use
         # THAT document: it is already fully resolved (the user can see it), so
@@ -529,7 +555,7 @@ class SolidWorks:
         # reference re-resolution that can come up with 0 components for a
         # .SLDASM whose parts live elsewhere.  Read-only: extraction never saves,
         # and attach mode never closes the user's docs.
-        if getattr(self, "_attached", False):
+        if getattr(self, "_attached", False) and reuse_open:
             existing = self._find_open_doc(path)
             if existing is not None:
                 print("      reusing the already-open document from your "
@@ -787,7 +813,29 @@ class SolidWorks:
         """An already-open ModelDoc2 whose title matches ``path``'s file name, or
         None.  Lets a reused session extract from the user's resolved document
         instead of opening a (possibly unresolvable) copy."""
+        want_path = os.path.normcase(os.path.abspath(path))
         want = os.path.splitext(os.path.basename(path))[0].lower()
+
+        def matches(d):
+            if d is None:
+                return False
+            # ActiveDoc is more reliable than GetDocuments on some SolidWorks
+            # releases (and when the user has an assembly open in lightweight
+            # or flexible mode).  Prefer an exact path, then fall back to the
+            # historical title comparison for unsaved/copy documents.
+            raw_path = safe_prop(d, "GetPathName")
+            if raw_path:
+                try:
+                    if os.path.normcase(os.path.abspath(str(raw_path))) == want_path:
+                        return True
+                except Exception:
+                    pass
+            title = safe_prop(d, "GetTitle") or ""
+            return os.path.splitext(os.path.basename(str(title)))[0].lower() == want
+
+        active = safe_prop(self.app, "ActiveDoc")
+        if matches(active):
+            return active
         docs = safe_call(self.app, "GetDocuments")
         if docs is None:
             # fall back to the linked-list walk on versions without GetDocuments
@@ -799,11 +847,7 @@ class SolidWorks:
                 d = safe_call(d, "GetNext")
                 seen += 1
         for d in (docs or []):
-            try:
-                title = safe_prop(d, "GetTitle") or ""
-            except Exception:
-                continue
-            if os.path.splitext(title)[0].lower() == want:
+            if matches(d):
                 return d
         return None
 

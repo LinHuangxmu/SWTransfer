@@ -34,6 +34,7 @@ CASES = [
     # NejiNeji connector parts merely CONTAIN 'screw' -- not fasteners
     ("Connector", "screwlock_male_hard_jointbase_v4", False),
     ("Connector", "ScrewRing_F", False),
+    ("LinearModule", "Screw_Rod-1", False),  # a driven lead screw, not a bolt
 ]
 
 

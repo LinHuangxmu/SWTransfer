@@ -14,6 +14,7 @@ from sw2robot.exporter.state import (
     GraphState,
     LimitJoint,
     MateEdge,
+    SubGraph,
 )
 
 
@@ -121,6 +122,36 @@ def test_without_limit_joint_the_distance_mate_fixes_it():
     model = build_model(_graph(None))
     j = next(j for j in model.joints if j.child == "slider")
     assert j.jtype == "fixed"
+
+
+def test_limit_joint_inside_expanded_subassembly_survives_serialization():
+    """An internal LimitDistance must not fall back to the generic +/-50 mm."""
+    base = _comp("base")
+    base.fixed = True
+    inst = _comp("module", (0.2, 0, 0))
+    inst.is_subassembly = True
+    inst.part_path = "module.SLDASM"
+    sub = SubGraph(
+        components=[_comp("case"), _comp("slider", (0, 0.1, 0))],
+        edges=[MateEdge(
+            a="case", b="slider", types=["DISTANCE"],
+            limit_joint={"type": "prismatic", "ref": "slider",
+                          "axis_point": [0, 0, 0], "axis_dir": [0, 1, 0],
+                          "lower": 0.0, "upper": 0.4})],
+        ground=["case"],
+    )
+    graph = GraphState(
+        robot_name="t", source_assembly="t.SLDASM",
+        components=[base, inst],
+        edges=[MateEdge(a="base", b="module", types=["COINCIDENT"])],
+        ground=["base"], subassemblies={"module.SLDASM": sub})
+
+    model = build_model(graph)
+    joint = next(j for j in model.joints if j.child.endswith("__slider"))
+    assert joint.jtype == "prismatic"
+    assert joint.lower == 0.0
+    assert joint.upper == 0.4
+    np.testing.assert_allclose(joint.axis, [0, 1, 0])
 
 
 def test_rigid_group_stays_together_under_limit_joints():

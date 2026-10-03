@@ -215,7 +215,12 @@ def _extract_into(sw, assembly_path, pkg_dir, meshes_dir, robot_name, _say,
                                   robot_name, _say)
     _say(f"opening copy of {os.path.basename(assembly_path)} "
          f"(loading the assembly) ...")
-    doc = sw.open_copy(assembly_path)
+    # Prefer the already-open resolved document when attached.  Some assemblies
+    # store references outside the assembly folder and a throw-away copy then
+    # opens with zero components even though the visible SolidWorks document is
+    # fully resolved.  The native DOF pass is reversible: every temporary fix,
+    # limit suppression and rebuild is restored in ``finally``.
+    doc = sw.open_copy(assembly_path, reuse_open=True)
     # surface the choice: extracts silently follow the file's SAVED-ACTIVE
     # configuration, which is not necessarily the one on the user's screen
     cfgs, used_cfg = [], None
@@ -263,10 +268,12 @@ def _extract_into(sw, assembly_path, pkg_dir, meshes_dir, robot_name, _say,
              "--part-frames, or without a full re-extract: "
              "sw2urdf-extract <pkg_dir> --refresh frames --attach")
     frames_out = part_coordinate_systems if scan_part_frames else None
+    # The solver pass is reversible and restores every temporary change, so it
+    # can also run against an attached, already-resolved document.
     comps, adjacency, ground = extract_graph(
         doc, robot_name, assembly_path, progress=_part,
         part_coordinate_systems_out=frames_out,
-        part_frames_scanned=part_frames_scanned)
+        part_frames_scanned=part_frames_scanned, solver_dofs=True)
     (coordinate_systems,
      reference_axes,
      sw2urdf_marker,
@@ -295,7 +302,8 @@ def _extract_into(sw, assembly_path, pkg_dir, meshes_dir, robot_name, _say,
         doc, comps, sw=sw, progress=_part,
         coordinate_systems_out=subassembly_coordinate_systems,
         part_coordinate_systems_out=frames_out,
-        part_frames_scanned=part_frames_scanned)
+        part_frames_scanned=part_frames_scanned,
+        solver_dofs=True)
 
     # A SolidWorks mirror copy inherits geometry but not per-body materials or
     # an Override Mass Properties value, so its weight silently falls back to
