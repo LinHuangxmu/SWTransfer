@@ -1,4 +1,4 @@
-  // ---- i18n: DISPLAY language only (EN / 日本語).  NOTE: this never touches
+  // ---- i18n: DISPLAY language only (EN / 日本語 / 简体中文).  NOTE: this never touches
   // any filesystem path, package name, or Google-Drive "shared drives" mount
   // name -- those are real on-disk identifiers (they carry the SolidWorks
   // paths) and are resolved server-side; we only translate UI chrome. --------
@@ -1041,17 +1041,97 @@
                  ja: 'left-drag: 視点回転 · right-drag: pan · wheel: zoom · クリックでリンク選択 · 関節はパネルのスライダーで操作（🖐 pose ON でリンクをドラッグして関節を動かせます）' },
   };
 
+  // Chinese UI coverage.  The main resource table deliberately keeps the
+  // existing EN/JA entries untouched; keys not yet translated here fall back
+  // to English so a new feature can never render a raw translation key.
+  const ZH_I18N = {
+    'lang.title': '显示语言',
+    'boot.pageLoaded': '页面已加载；正在从 unpkg.com 导入 three.js 和 urdf-loader …',
+    'backend.down': '⚠ 无法连接 sw2robot 服务器，可能已停止。请在终端重启后重新加载。',
+    'backend.reload': '⟳ 重新加载',
+    'common.close': '关闭', 'common.cancel': '取消', 'common.na': '（无）',
+    'common.none': '（无）', 'common.openFirst': '请先打开一个包',
+    'status.starting': '正在启动…', 'status.rebuilding': '⏳ 正在重建 URDF …',
+    'status.loadingUrdf': '正在加载 URDF …',
+    'status.summary': a => `${a.links} 个链接 · ${a.joints} 个可动关节 · 网格 ${a.done}/${a.want}${a.tail}`,
+    'status.summaryFail': a => `（${a.n} 个失败）`,
+    'mesh.tick': a => `网格 ${a.i}/${a.n} ${a.mark} ${a.name}${a.detail}`,
+    'mesh.status': a => `正在加载网格 ${a.i}/${a.n}${a.fail}`,
+    'mesh.statusFail': a => `（${a.n} 个失败）`,
+    'mesh.barText': a => `网格 ${a.i}/${a.n}  ${a.name}`,
+    'mesh.barSub': '正在加载网格 …', 'mesh.unsupported': '不支持的网格格式',
+    'mesh.loadFailed': '加载失败', 'mesh.allLoaded': '所有网格已加载 ✓',
+    'start.pick': '选择一个包',
+    'start.noPkg': '尚未打开包 — 点击查看器或 🗄 打开（最近文件 / 粘贴完整路径）',
+    'ui.title': 'sw2robot 查看器',
+    'ui.emptyDrop': '点击此处打开包',
+    'ui.emptyPick': '最近文件 · 粘贴完整路径 · 右侧 🗄',
+    'ui.useactive': '🎯 提取 SolidWorks 中当前打开的装配体',
+    'ui.fsbrowse': '🗄 打开…', 'ui.clearmesh': '♻ 丢弃网格并重新提取',
+    'ui.reset': '重置姿态 (0)', 'ui.resetview': '↺ 重置视图',
+    'ui.clearview': '清空', 'ui.renamelist': '≣ 重命名',
+    'ui.masslist': '⚖ 质量', 'ui.playmode': '▶ 运动', 'ui.playhome': '↺ 全部归零',
+    'ui.playempty': '没有可动关节（全部为 fixed）。',
+    'ui.playhint': '提示：选择关节后按 T 切换固定/可动（滑块同样适用）',
+    'ui.selroot': '⌂ 设为根链接', 'ui.bulkArrow': '→ 批量设置：',
+    'ui.btFixed': '固定', 'ui.btRevolute': '旋转', 'ui.btContinuous': '连续旋转',
+    'ui.btPrismatic': '直线移动', 'ui.btMassOnly': '仅质量',
+    'ui.mimicapply': '应用 (Enter)', 'ui.bulkDelete': '删除', 'ui.set': '设置',
+    'ui.boxselect': '⬚ 框选', 'ui.autolimits': '🛠 自动关节限位',
+    'ui.marginLabel': '余量：', 'ui.marginRev': '旋转', 'ui.marginPris': '直线',
+    'ui.selectedArrow': '已选择 →',
+    'ui.exppkgname': '包', 'ui.expurdfname': 'URDF', 'ui.exprobotname': '机器人',
+    'ui.expmeshdir': '网格目录', 'ui.expvisfmt': '视觉', 'ui.expcolfmt': '碰撞',
+    'ui.expdae': '⬇ ROS1 包', 'ui.expros2': '⬇ ROS2 包', 'ui.expmjcf': '⬇ MuJoCo (MJCF)',
+    'ui.expfixedbase': '固定基座', 'ui.collmode': '碰撞',
+    'ui.collcopy': '视觉网格', 'ui.collhull': '凸包',
+    'ui.collcoacd': 'CoACD（凸分解）', 'ui.collprimitive': '基本体（自动）',
+    'ui.collbox': '盒体', 'ui.collcylinder': '圆柱', 'ui.collsphere': '球体',
+    'ui.coacd': 'CoACD 碰撞', 'ui.cqbalanced': '平衡', 'ui.cqfine': '精细',
+    'ui.coacdgen': '⚙ 生成碰撞', 'ui.coacdshow': '显示碰撞',
+    'ui.collview': '▦ 碰撞', 'ui.mergeview': '🔗 合并固定链接',
+    'ui.mergefixed': '合并固定链接', 'ui.coacdstop': '■ 停止',
+    'subasm.directBtn': '子装配体', 'subasm.title': 'CAD 子装配体',
+    'subasm.none': '此包中没有 CAD 子装配体。',
+    'subasm.thName': 'CAD 名称', 'subasm.thLink': '链接',
+    'subasm.thChildren': '子项', 'subasm.thEdges': '配合',
+    'subasm.thState': '状态', 'subasm.thMode': '模式', 'subasm.thPath': '文件',
+    'tree.modeExpanded': '展开', 'tree.modeSubassembly': '子装配体',
+    'tree.subasmLoading': '正在加载子装配体树…',
+    'mass.listTitle': '质量编辑器', 'mass.thLink': '链接',
+    'mass.thMaterial': '材料', 'mass.thMass': '质量',
+    'mass.thDensity': '密度 (kg/m³)', 'mass.thTarget': '目标 (kg)',
+    'mass.thMassOnly': '仅质量', 'mass.thReview': '已检查',
+    'mass.allGood': '所有链接质量均已设置或检查 ✓',
+    'export.bar': a => `正在导出 ${a.what} 包 …`,
+    'export.start': a => `正在导出 ${a.what} 包（转换网格）…`,
+    'export.done': a => `已导出 ${a.file}`, 'export.fail': a => `导出失败：${a.e}`,
+    'export.cancelling': '正在取消导出 …', 'export.cancelled': '导出已取消',
+    'prog.working': '处理中 …', 'prog.cancelling': '正在取消 — 正在完成当前步骤 …',
+    'prog.s.connect': '连接 SolidWorks', 'prog.s.extract': '提取装配体',
+    'prog.s.meshes': '导出网格', 'prog.s.build': '构建包', 'prog.s.load': '加载模型',
+    'prog.s.sweep': '扫描关节', 'prog.s.collision': '碰撞形状',
+    'prog.s.convert': '转换网格', 'prog.s.zip': '打包并压缩',
+    'view.reset': '视图已恢复初始状态', 'view.cleared': '查看器已清空',
+    'redetect.start': '正在重新检测闭环耦合 …',
+    'redetect.none': '未找到闭环（四连杆）耦合',
+    'ui.hint': '左键拖动：旋转视角 · 右键拖动：平移 · 滚轮：缩放 · 点击选择链接 · 使用面板滑块操作关节（开启 🖐 姿态后可拖动链接）',
+  };
+
   function detectLang() {
-    // ?lang=ja|en wins (deep-linking / deterministic tests) and is remembered;
+    // ?lang=ja|en|zh wins (deep-linking / deterministic tests) and is remembered;
     // otherwise a saved choice, otherwise the browser's UI language.
     const q = new URLSearchParams(location.search).get('lang');
-    if (q === 'ja' || q === 'en') {
+    if (q === 'ja' || q === 'en' || q === 'zh') {
       localStorage.setItem('sw2robot.lang', q);
       return q;
     }
     const saved = localStorage.getItem('sw2robot.lang');
-    if (saved === 'ja' || saved === 'en') { return saved; }
-    return (navigator.language || '').toLowerCase().startsWith('ja') ? 'ja' : 'en';
+    if (saved === 'ja' || saved === 'en' || saved === 'zh') { return saved; }
+    const browserLang = (navigator.language || '').toLowerCase();
+    if (browserLang.startsWith('ja')) { return 'ja'; }
+    if (browserLang.startsWith('zh')) { return 'zh'; }
+    return 'en';
   }
   window.__lang = detectLang();
   document.documentElement.lang = window.__lang;
@@ -1061,7 +1141,9 @@
   function t(key, args) {
     const entry = I18N[key];
     if (!entry) { return key; }
-    const v = entry[window.__lang] ?? entry.en ?? key;
+    const v = window.__lang === 'zh'
+      ? (ZH_I18N[key] ?? entry.zh ?? entry.en ?? key)
+      : (entry[window.__lang] ?? entry.en ?? key);
     return typeof v === 'function' ? v(args ?? {}) : v;
   }
   window.t = t;
@@ -1081,7 +1163,7 @@
   window.applyStaticI18n = applyStaticI18n;
 
   function setLang(lang) {
-    if (lang !== 'ja' && lang !== 'en') { return; }
+    if (lang !== 'ja' && lang !== 'en' && lang !== 'zh') { return; }
     window.__lang = lang;
     localStorage.setItem('sw2robot.lang', lang);
     document.documentElement.lang = lang;
