@@ -2959,21 +2959,28 @@ def _demote_globally_locked(comps, adjacency, edge):
         if np.linalg.norm(rel) < 1e-6:
             jt, ax, note = edge[key]
             # The assembly-wide SVD is a fallback for graphs where SolidWorks
-            # could not provide a usable answer.  It must not erase a native
-            # single-DOF result merely because a redundant loop makes this
-            # reconstructed nullspace look rigid.
+            # could not provide a usable answer.  A direct component snapshot
+            # is different: GetRemainingDOFs reports the component's GLOBAL
+            # motion, not the relative motion across this Mate edge.  In a
+            # gantry, for example, a rigidly bolted Z module moves with Y and
+            # can therefore report one Y translation.  Do not let that global
+            # snapshot override the relative constraint solve.
             solver = arec.get("solver_dof") if isinstance(arec, dict) else None
             native_active = (isinstance(solver, dict) and any(
                 _solver_active(axis)
                 for group in ("rotations", "translations")
                 for axis in (solver.get(group) or [])))
-            if native_active:
+            component_snapshot = (isinstance(solver, dict)
+                                  and solver.get("note")
+                                  == "direct component snapshot")
+            if native_active and not component_snapshot:
                 # This is a redundant native-solver query on a loop edge.  A
                 # zero relative motion is expected there; treating it as a
                 # rigid parent would steal the actual tree joint.
                 continue
             native = _solver_joint(arec) if isinstance(solver, dict) else None
-            if native is not None and native[0] in _MOVABLE_TYPES:
+            if (native is not None and native[0] in _MOVABLE_TYPES
+                    and not component_snapshot):
                 continue
             rigid.add(key)
             if jt in _MOVABLE_TYPES:

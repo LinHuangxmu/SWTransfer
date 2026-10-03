@@ -18,6 +18,7 @@ from sw2robot.exporter.model import (
     _solver_active_axes,
     _solver_state_from_tuple,
     _attach_component_solver_evidence,
+    _demote_globally_locked,
     _transform_rec,
     _auto_parent_map,
     classify_edge_auto,
@@ -229,6 +230,61 @@ def test_component_snapshot_attaches_to_matching_axis_edges():
     assert state["queried_child"] == "carriage"
     assert state["tree_edge"] is True
     assert _solver_active_axes(state)[0]["type"] == "prismatic"
+
+
+def test_component_snapshot_does_not_override_rigid_relative_mate():
+    """A component's global travel must not become a rigid-edge joint.
+
+    This is the top-level gantry failure mode: a Z module reports the Y
+    translation it inherits from the moving X/Y carriage, while its external
+    six-mate connection is rigid.  The assembly-wide relative solve must
+    demote that edge back to fixed.
+    """
+    frame = Component("frame", "frame", "frame.SLDPRT", False,
+                     np.eye(4), True, 0)
+    child = Component("z_module", "z_module", "z.SLDASM", True,
+                      np.eye(4), False, 0)
+    wall = Component("wall", "wall", "wall.SLDPRT", False,
+                     np.eye(4), True, 0)
+    state = _solver_state_from_tuple(
+        _raw(translation=True), parent_name="frame", child_name="z_module",
+        child_origin=[0.0, 0.0, 0.0])
+    state["tree_edge"] = True
+    state["note"] = "direct component snapshot"
+    edge_key = frozenset(("frame", "z_module"))
+    # Two coincident planes plus two concentric axes at separate locations
+    # fully constrain the pair, even though the child moves globally with Y.
+    mates = [
+        {"type": "COINCIDENT", "etypes": [3, 3],
+         "points": [[0, 0, 0], [0, 0, 0]],
+         "dirs": [[0, 0, 1], [0, 0, 1]], "radii": [0, 0]},
+        {"type": "CONCENTRIC", "etypes": [4, 4],
+         "points": [[0, 0, 0], [0, 0, 0]],
+         "dirs": [[0, 1, 0], [0, 1, 0]], "radii": [0.002, 0.002]},
+        {"type": "CONCENTRIC", "etypes": [4, 4],
+         "points": [[0, 0, 0.02], [0, 0, 0.02]],
+         "dirs": [[0, 1, 0], [0, 1, 0]], "radii": [0.002, 0.002]},
+    ]
+    adjacency = {edge_key: {
+        "types": ["COINCIDENT", "CONCENTRIC", "CONCENTRIC"],
+        "mates": mates, "solver_dof": state}}
+    wall_key = frozenset(("z_module", "wall"))
+    adjacency[wall_key] = {
+        "types": ["LOCK"],
+        "mates": [{"type": "LOCK", "etypes": [], "points": [],
+                   "dirs": [], "radii": []}],
+        "solver_dof": None,
+    }
+    frame_wall_key = frozenset(("frame", "wall"))
+    adjacency[frame_wall_key] = dict(adjacency[wall_key])
+    edge = {edge_key: ("prismatic",
+                       (np.zeros(3), np.array([0.0, 1.0, 0.0])),
+                       "solidworks solver: single L freedom")}
+    edge[wall_key] = ("fixed", None, "geo: fully constrained")
+    edge[frame_wall_key] = ("fixed", None, "geo: fully constrained")
+    _demote_globally_locked([frame, child, wall], adjacency, edge)
+    assert edge[edge_key][0] == "fixed"
+    assert "globally locked" in edge[edge_key][2]
 
 
 def test_expanded_solver_query_names_follow_instance_prefix():
