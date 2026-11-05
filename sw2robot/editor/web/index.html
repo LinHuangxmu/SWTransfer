@@ -102,7 +102,8 @@
                      border-radius:3px;padding:1px 4px"></select>
     </div>
     <div id="hovertip"></div>
-    <div id="colstat" style="position:absolute;left:50%;top:36px;
+    <div id="colstat" style="position:absolute;left:50%;
+         top:var(--views-bottom, 36px);
          transform:translateX(-50%);z-index:5;display:none;max-width:70%;
          background:#5b1111dd;color:#ffb3b3;border:1px solid #a33;
          border-radius:4px;padding:3px 10px;font-size:12px;
@@ -185,7 +186,8 @@
       <div class="lb-log"></div>
       <button id="lbstop" data-i18n="ui.coacdstop">■ stop</button>
     </div>
-    <div id="selbar" style="position:absolute;top:40px;left:8px;z-index:5;
+    <div id="selbar" style="position:absolute;left:8px;z-index:5;
+         top:calc(var(--views-bottom, 36px) + 4px);
          display:none;gap:4px;align-items:center;background:#22252bdd;
          border:1px solid #444;border-radius:4px;padding:4px 8px;
          font-size:12px">
@@ -251,9 +253,7 @@
   <div id="panel">
     <div id="langbar" style="display:flex;gap:4px;justify-content:flex-end;
          margin-bottom:2px" data-i18n-title="lang.title" title="display language">
-      <button data-lang="en" style="font-size:11px;padding:1px 7px">EN</button>
-      <button data-lang="ja" style="font-size:11px;padding:1px 7px">日本語</button>
-      <button data-lang="zh" style="font-size:11px;padding:1px 7px">中文</button>
+      <!-- one button per language, made by i18n.js from its LANGS list -->
     </div>
     <!-- #title / #status carry dynamic text (package name, live status), so
          they are NOT data-i18n (that would reset them on a language switch);
@@ -618,6 +618,7 @@ the config and does NOT re-detect). Needs graph.json (CAD mode).">🔗 re-detect
 
 <!-- plain (non-module) script: runs even if ES-module loading breaks, so
      errors during CDN imports are always visible on the page -->
+<script src="i18n.zh-CN.js"></script>
 <script src="i18n.js"></script>
 <script src="boot.js"></script>
 

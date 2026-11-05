@@ -17,9 +17,12 @@
 **SolidWorks → robot (URDF) converter.** Turn a SolidWorks assembly into a
 URDF, then clean it up in the browser.
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jsk-ros-pkg/solidworks_urdf_exporter2/main/assets/solidworks-to-robot.gif" alt="SolidWorks → robot (URDF) editor demo">
-</p>
+https://github.com/user-attachments/assets/96c70440-b0b2-4546-af10-1568d4b97819
+
+**New here?** The [tutorial](https://jsk-ros-pkg.github.io/solidworks_urdf_exporter2/tutorial/)
+([日本語](https://jsk-ros-pkg.github.io/solidworks_urdf_exporter2/ja/tutorial/))
+builds a quadruped in SolidWorks from three simple parts and turns it into a
+URDF; its files are in [`examples/quadruped`](examples/quadruped).
 
 One import package, with two subpackages:
 
@@ -407,6 +410,45 @@ sheet — so this needs **scikit-robot 0.3.34 or newer**; on 0.3.33 such an
 assembly fails with `mesh volume is too small` or `at least 4 vertices
 required`.
 
+**Export for Isaac Sim (or any PBR renderer).** `--isaac` writes a standalone
+`<robot>_isaac` package next to the URDF one: mesh references relative to the
+URDF file (no ROS package path to set up), `.glb` visuals and `.stl` collision,
+and no ROS build files.
+
+For a fixture (a rig, a table, anything welded to the floor) add
+`--world-link`, or `world_link: true` in the joint config: a massless `world`
+root fixed to the base link at the base's assembly pose, so the URDF's origin
+is the CAD assembly's origin. Without it the base part's own frame becomes
+the origin, and a rig whose base part sits 74 mm above the CAD floor loads
+74 mm into the simulator's ground. It is off by default, and independent of
+`--isaac`, because a mobile robot must not be welded to the CAD origin;
+`--no-world-link` overrides a config that turns it on.
+
+```bash
+python -m sw2robot.exporter.export path/to/assembly.sldasm -o output --isaac --world-link
+
+# the ROS package can carry the same glb visuals
+python -m sw2robot.exporter.export path/to/assembly.sldasm -o output --ros-pkg --visual-format glb
+```
+
+Each `.glb` carries one glTF PBR material -- metallic / roughness -- on top of
+the CAD's per-face colours, which is what makes an aluminium extrusion read as
+aluminium rather than grey clay. A `.glb` with no material is, by the glTF
+spec, a fully rough metal, and that is what every mesh exported before this
+looked like in Isaac Sim. The finish comes from, in order: a `materials:`
+override in the joints config (`link_name: chrome`, or
+`link_name: {metallic: 1.0, roughness: 0.3}`; presets in
+`sw2robot/exporter/pbr.py`); the part's SolidWorks **appearance** (`satin
+finish aluminum`, `chromium plate`, `black low gloss plastic`, ... -- read at
+extract time and recorded on the link's `<!-- sw2robot appearance=... -->`
+comment); the part's SolidWorks **material** name (`6061 Alloy`, `ABS`); else a
+neutral dielectric. Measured on Isaac Sim 6.0.0: its URDF importer takes the
+`.glb` geometry but drops the materials and even the colours, so for Isaac Sim
+convert the package with scikit-robot's `urdf_to_usd` instead (it binds a
+`UsdPreviewSurface` per finish from the glTF material and the result renders
+as expected); add a dome light with an HDRI before judging the metals.
+three.js and trimesh read the glb materials directly.
+
 **Fast re-extract while debugging.** Keep the assembly open in SolidWorks, then:
 
 ```bash
@@ -423,7 +465,6 @@ python -m sw2robot.exporter.extract output/<robot> --refresh frames --attach
 sw2robot/                one import package (pip install sw2robot)
   exporter/              SolidWorks -> graph.json -> URDF
   editor/                the browser editor (server + single-page web/index.html)
-    _vendor/rc_config/   vendored ROS/MoveIt/Gazebo config generators
 examples/fingertip/      a small pre-extracted package to try the editor offline
 tests/                   pytest (sw2robot.exporter classification) + tests/e2e (puppeteer UI suite)
 ```

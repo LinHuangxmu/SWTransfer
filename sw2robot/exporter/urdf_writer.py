@@ -25,7 +25,7 @@ from skrobot.utils.inertia import (
     validate_inertia,
 )
 
-from .geometry import fmt_urdf_vec
+from .geometry import fmt_urdf_vec, matrix_to_xyz_rpy
 from .inertia import link_inertial
 from .model import safe_name
 
@@ -49,7 +49,8 @@ def _comment_safe(text):
 def _provenance_comment(comp, method):
     """Build the ``<!-- sw2robot ... -->`` provenance line for a link.
 
-    Records the SolidWorks material, its density (kg/m^3) and how the inertial
+    Records the SolidWorks material, its appearance (the ``.p2m`` the PBR
+    export keys on), its density (kg/m^3) and how the inertial
     was obtained (``solidworks`` / ``mesh`` / ``hull`` / ``bbox`` /
     ``placeholder``), so the exported URDF is self-documenting. Returns ``None``
     when there is nothing worth recording.
@@ -68,6 +69,9 @@ def _provenance_comment(comp, method):
     density = getattr(comp, "density", None)
     if material:
         fields.append(f'material="{_comment_safe(material)}"')
+    appearance = getattr(comp, "appearance", None)
+    if appearance:
+        fields.append(f'appearance="{_comment_safe(appearance)}"')
     if density is not None:
         fields.append(f'density="{float(density):g}"')  # kg/m^3
     if method:
@@ -222,6 +226,25 @@ def _link_xml(comp, ros_pkg=None, rn=lambda n: n, mesh_dir=None, density=None):
     return "\n".join(lines), method, problems
 
 
+def _world_link_xml(model, rn):
+    """A ``world`` root link and the fixed joint placing the base link at its
+    assembly pose (``Component.world``, metres)."""
+    base = next((c for c in model.components if c.link_name == model.base_link),
+                None)
+    if base is None:
+        raise ValueError(f"base link {model.base_link!r} is not a component")
+    xyz, rpy = matrix_to_xyz_rpy(base.world)
+    root = rn(base.link_name)
+    return [
+        '  <link name="world"/>',
+        f'  <joint name="world_to_{root}" type="fixed">',
+        f'    <origin xyz="{fmt_urdf_vec(xyz)}" rpy="{fmt_urdf_vec(rpy)}"/>',
+        '    <parent link="world"/>',
+        f'    <child link="{root}"/>',
+        '  </joint>',
+    ]
+
+
 def _attrs(spec, source):
     """Render ``name="value"`` attribute pairs for the keys in ``spec`` that are
     present (not None) in mapping ``source``, in ``spec`` order."""
@@ -320,12 +343,18 @@ def _port_xml(port, rn=lambda n: n, link_name=None, joint_name=None):
 
 
 def write_urdf(model, urdf_path, ros_pkg=None, density=None,
-               link_overrides=None, joint_overrides=None):
+               link_overrides=None, joint_overrides=None, world_link=False):
     """Write the URDF.  ``link_overrides`` / ``joint_overrides`` map a COMPONENT
     link name / joint name to a user-chosen display name (from the editor's
     rename feature); they are applied before safe_name + collision suffixing, so
     every reference (parent/child/mimic) follows automatically.  The root link
     keeps using ``root_link_name``.
+
+    ``world_link`` adds a massless ``world`` link as the root, fixed to the
+    base link at the base's ASSEMBLY pose, so the URDF's origin is the CAD
+    assembly's origin rather than the base part's own frame.  Without it a
+    fixed-base rig whose base part sits above the CAD floor loads that far
+    into the ground in Isaac Sim / MuJoCo (74 mm on the dielectric rig).
 
     Returns the set of FINAL (emitted) link names that are mass-only -- the
     export step folds these into their fixed parent.  write_urdf owns the name
@@ -383,6 +412,8 @@ def write_urdf(model, urdf_path, ros_pkg=None, density=None,
     mesh_dir = os.path.dirname(os.path.dirname(os.path.abspath(urdf_path)))
 
     parts = ['<?xml version="1.0"?>', f'<robot name="{model.name}">']
+    if world_link:
+        parts.extend(_world_link_xml(model, rn))
     methods = {}
     bad_inertia = {}
     mass_only_links = set()
@@ -449,6 +480,11 @@ PACKAGE_XML_ROS2 = """<?xml version="1.0"?>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>hardware_interface</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
   <export>
     <build_type>ament_cmake</build_type>
   </export>
@@ -458,7 +494,7 @@ PACKAGE_XML_ROS2 = """<?xml version="1.0"?>
 CMAKELISTS_ROS2 = """cmake_minimum_required(VERSION 3.8)
 project({name})
 find_package(ament_cmake REQUIRED)
-install(DIRECTORY urdf meshes launch rviz
+install(DIRECTORY urdf meshes launch rviz config
   DESTINATION share/${{PROJECT_NAME}})
 ament_package()
 """
@@ -502,7 +538,9 @@ def generate_launch_description():
 # A minimal RViz2 config so the robot shows up immediately (RobotModel from the
 # /robot_description topic, TF, grid).  {fixed_frame} = the root link name,
 # {tf_scale} = TF axis ("Marker Scale") sized to the model so the triads do not
-# dwarf small parts (<= 1.0).
+# dwarf small parts (<= 1.0); {cell_size}, {distance} and {fx}/{fy}/{fz} = grid
+# cell and orbit camera framing the whole model (RViz's 1 m / 10 m defaults
+# leave a small robot a dot in the middle of the grid).
 RVIZ_CONFIG_ROS2 = """Panels:
   - Class: rviz_common/Displays
     Name: Displays
@@ -511,6 +549,7 @@ Visualization Manager:
     - Class: rviz_default_plugins/Grid
       Enabled: true
       Name: Grid
+      Cell Size: {cell_size}
     - Class: rviz_default_plugins/RobotModel
       Enabled: true
       Name: RobotModel
@@ -537,7 +576,105 @@ Visualization Manager:
     Current:
       Class: rviz_default_plugins/Orbit
       Name: Current View
+      Distance: {distance}
+      Focal Point:
+        X: {fx}
+        Y: {fy}
+        Z: {fz}
 """
+
+# --- ROS 2 xacro + ros2_control ----------------------------------------------
+# The robot as a xacro macro (urdf/<robot>.urdf.xacro, skrobot's
+# modularize-urdf), a ros2_control macro for its movable joints, and a top-level
+# urdf/<robot>_control.urdf.xacro that puts the two together on a `world` link.
+# control.launch.py runs that through controller_manager with mock hardware, so
+# a trajectory sent to the package moves the robot in RViz with no real servo;
+# `plugin:=` swaps in a real hardware interface or gz_ros2_control.  The
+# <ros2_control> element itself comes from skrobot's
+# build_ros2_control_elements and the controllers config from
+# generate_controllers_yaml; only the xacro wrapping and the launch live here.
+# {macro} = xacro macro name, {ros2_control} = the serialised element.
+ROS2_CONTROL_XACRO = """<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:macro name="{macro}_ros2_control"
+               params="prefix:='' plugin:=mock_components/GenericSystem">
+    {ros2_control}
+  </xacro:macro>
+</robot>
+"""
+
+# {name} = package name, {robot} = urdf file stem, {macro} = xacro macro name.
+# This is the one robot that control.launch.py runs, so it takes no prefix: the
+# controllers config names the joints unprefixed.  Composing several robots
+# goes through the two macros above, each with its own prefix and controllers.
+ROS2_CONTROL_URDF_XACRO = """<?xml version="1.0"?>
+<robot name="{robot}" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:arg name="plugin" default="mock_components/GenericSystem"/>
+  <xacro:include filename="$(find {name})/urdf/{robot}.urdf.xacro"/>
+  <xacro:include filename="$(find {name})/urdf/{robot}.ros2_control.xacro"/>
+  <link name="world"/>
+  <xacro:{macro} parent_link="world"/>
+  <xacro:{macro}_ros2_control plugin="$(arg plugin)"/>
+</robot>
+"""
+
+# {name} = package name, {robot} = urdf file stem, {spawn} = the controllers
+# to start after joint_state_broadcaster
+CONTROL_LAUNCH_ROS2 = '''import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import Command, LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+def generate_launch_description():
+    pkg = get_package_share_directory("{name}")
+    xacro_file = os.path.join(pkg, "urdf", "{robot}_control.urdf.xacro")
+    controllers = os.path.join(pkg, "config", "ros2_controllers.yaml")
+    rviz = os.path.join(pkg, "rviz", "{robot}.rviz")
+    plugin = LaunchConfiguration("plugin")
+    robot_description = {{"robot_description": ParameterValue(
+        Command(["xacro ", xacro_file, " plugin:=", plugin]), value_type=str)}}
+    spawners = [
+        Node(package="controller_manager", executable="spawner",
+             arguments=[c, "--controller-manager", "/controller_manager"])
+        for c in ["joint_state_broadcaster"{spawn}]
+    ]
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            "plugin", default_value="mock_components/GenericSystem",
+            description="ros2_control hardware interface"),
+        DeclareLaunchArgument("rviz", default_value="true"),
+        Node(
+            package="robot_state_publisher",
+            executable="robot_state_publisher",
+            output="screen",
+            parameters=[robot_description],
+        ),
+        Node(
+            package="controller_manager",
+            executable="ros2_control_node",
+            output="screen",
+            # Humble reads the description from this parameter; Jazzy from
+            # its ~/robot_description topic, which robot_state_publisher
+            # publishes as /robot_description
+            parameters=[robot_description, controllers],
+            remappings=[("~/robot_description", "/robot_description")],
+        ),
+        *spawners,
+        Node(
+            package="rviz2",
+            executable="rviz2",
+            output="screen",
+            arguments=["-d", rviz],
+            condition=IfCondition(LaunchConfiguration("rviz")),
+        ),
+    ])
+'''
 
 # --- ROS 2 closed-loop variants ---------------------------------------------
 # A package with a detected kinematic loop ships three extra pieces: the loop
@@ -559,6 +696,11 @@ PACKAGE_XML_ROS2_COUPLED = """<?xml version="1.0"?>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>hardware_interface</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>python3-yaml</exec_depend>

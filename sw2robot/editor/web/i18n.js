@@ -1,4 +1,4 @@
-  // ---- i18n: DISPLAY language only (EN / 日本語 / 简体中文).  NOTE: this never touches
+  // ---- i18n: DISPLAY language only (see LANGS below).  NOTE: this never touches
   // any filesystem path, package name, or Google-Drive "shared drives" mount
   // name -- those are real on-disk identifiers (they carry the SolidWorks
   // paths) and are resolved server-side; we only translate UI chrome. --------
@@ -608,6 +608,8 @@
     'flip.done': { en: a => `${a.joint}: + direction reversed (axis negated, limits swapped) ✓`,
                    ja: a => `${a.joint}: ＋方向を反転（軸の符号反転・リミット入替）✓` },
     'flip.fail': { en: a => `flip failed: ${a.e}`, ja: a => `反転に失敗: ${a.e}` },
+    'flip.notSaved': { en: a => `${a.joint}: no joints.yaml in this package, so the flip is in the URDF only — the next rebuild will undo it`,
+                       ja: a => `${a.joint}: このパッケージには joints.yaml がないため、反転は URDF にだけ入っています（次の再ビルドで元に戻ります）` },
     'flip.noTarget': { en: 'press f with a joint selected (or hover its axis) to reverse its + direction',
                        ja: 'f キーは関節を選択（または軸をホバー）してから。＋方向を反転します' },
     'flip.notMovable': { en: 'a fixed joint has no + direction to flip',
@@ -1041,9 +1043,7 @@
                  ja: 'left-drag: 視点回転 · right-drag: pan · wheel: zoom · クリックでリンク選択 · 関節はパネルのスライダーで操作（🖐 pose ON でリンクをドラッグして関節を動かせます）' },
   };
 
-  // Chinese UI coverage.  The main resource table deliberately keeps the
-  // existing EN/JA entries untouched; keys not yet translated here fall back
-  // to English so a new feature can never render a raw translation key.
+  // Chinese UI coverage retained for compatibility with older translations.
   const ZH_I18N = {
     'lang.title': '显示语言',
     'boot.pageLoaded': '页面已加载；正在从 unpkg.com 导入 three.js 和 urdf-loader …',
@@ -1118,19 +1118,37 @@
     'ui.hint': '左键拖动：旋转视角 · 右键拖动：平移 · 滚轮：缩放 · 点击选择链接 · 使用面板滑块操作关节（开启 🖐 姿态后可拖动链接）',
   };
 
+  // Display languages, in language-bar order.  English and Japanese live
+  // inline in I18N above; every other language is its own file,
+  // i18n.<code>.js, loaded BEFORE this one, that fills
+  // window.SW2_I18N[<code>] with { key: string | (args => string) }.  A key a
+  // language lacks falls back to English; tests/test_i18n_catalog.py keeps
+  // each file complete.  `match` picks the language from the browser's.
+  const LANGS = [
+    { code: 'en', label: 'EN', match: /^en\b/i },
+    { code: 'ja', label: '日本語', match: /^ja\b/i },
+    { code: 'zh-CN', label: '简体中文', match: /^zh\b/i },
+  ];
+  const EXTRA = window.SW2_I18N || {};
+  const isLang = code => LANGS.some(l => l.code === code);
+
   function detectLang() {
-    // ?lang=ja|en|zh wins (deep-linking / deterministic tests) and is remembered;
-    // otherwise a saved choice, otherwise the browser's UI language.
+    // ?lang=<code> wins (deep-linking / deterministic tests) and is
+    // remembered; otherwise a saved choice, otherwise the first of the
+    // browser's preferred languages we have.
     const q = new URLSearchParams(location.search).get('lang');
-    if (q === 'ja' || q === 'en' || q === 'zh') {
-      localStorage.setItem('sw2robot.lang', q);
-      return q;
+    const requested = q === 'zh' ? 'zh-CN' : q;
+    if (isLang(requested)) {
+      localStorage.setItem('sw2robot.lang', requested);
+      return requested;
     }
     const saved = localStorage.getItem('sw2robot.lang');
-    if (saved === 'ja' || saved === 'en' || saved === 'zh') { return saved; }
-    const browserLang = (navigator.language || '').toLowerCase();
-    if (browserLang.startsWith('ja')) { return 'ja'; }
-    if (browserLang.startsWith('zh')) { return 'zh'; }
+    if (saved === 'zh') { return 'zh-CN'; }
+    if (isLang(saved)) { return saved; }
+    for (const pref of navigator.languages || [navigator.language || '']) {
+      const hit = LANGS.find(l => l.match.test(pref));
+      if (hit) { return hit.code; }
+    }
     return 'en';
   }
   window.__lang = detectLang();
@@ -1141,9 +1159,9 @@
   function t(key, args) {
     const entry = I18N[key];
     if (!entry) { return key; }
-    const v = window.__lang === 'zh'
-      ? (ZH_I18N[key] ?? entry.zh ?? entry.en ?? key)
-      : (entry[window.__lang] ?? entry.en ?? key);
+    const v = EXTRA[window.__lang]?.[key]
+      ?? (window.__lang === 'zh-CN' ? ZH_I18N[key] : undefined)
+      ?? entry[window.__lang] ?? entry.en ?? key;
     return typeof v === 'function' ? v(args ?? {}) : v;
   }
   window.t = t;
@@ -1162,8 +1180,18 @@
   }
   window.applyStaticI18n = applyStaticI18n;
 
+  // one button per language; boot.js marks the active one, diagnostics.js
+  // wires the clicks
+  document.getElementById('langbar')?.replaceChildren(...LANGS.map(l => {
+    const b = document.createElement('button');
+    b.dataset.lang = l.code;
+    b.textContent = l.label;
+    b.style.cssText = 'font-size:11px;padding:1px 7px';
+    return b;
+  }));
+
   function setLang(lang) {
-    if (lang !== 'ja' && lang !== 'en' && lang !== 'zh') { return; }
+    if (!isLang(lang)) { return; }
     window.__lang = lang;
     localStorage.setItem('sw2robot.lang', lang);
     document.documentElement.lang = lang;

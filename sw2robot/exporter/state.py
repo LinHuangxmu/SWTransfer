@@ -34,6 +34,9 @@ class ComponentState(BaseModel):
     mesh_file: str | None = None    # relative path, e.g. "meshes/x.3dxml"
     material: str | None = None     # SolidWorks material name (e.g. "ABS")
     density: float | None = None    # kg/m^3 from that material
+    # SolidWorks appearance, as its .p2m path under the materials library
+    # (e.g. "metal/aluminum/satin finish aluminum"); None on older extracts
+    appearance: str | None = None
     # SolidWorks-native mass properties of the PART, in its own (part-local)
     # frame and SI units -- the same frame the mesh is exported in.  Preferred
     # over the mesh-derived estimate at build time (exact CAD geometry +
@@ -164,6 +167,12 @@ class LimitJoint(BaseModel):
     axis_dir: list[float]
     lower: float
     upper: float
+    # full Name2 of the component each side's mated entity belongs to
+    # ("Module-1/Slider-1" under top-level ``a`` = "Module-1").  When ``a`` is
+    # a sub-assembly the build expands, this says which child the joint moves.
+    # None on older extracts.
+    a_owner: str | None = None
+    b_owner: str | None = None
 
 
 class CoordinateSystemState(BaseModel):
@@ -211,6 +220,9 @@ class SubGraph(BaseModel):
     edges: list[MateEdge] = []
     ground: list[str] = []
     coordinate_systems: list[CoordinateSystemState] = []
+    # LimitDistance/LimitAngle mates authored INSIDE this sub-assembly, in its
+    # own frame, ``a``/``b`` naming its children (empty on older extracts)
+    limit_joints: list[LimitJoint] = []
 
 
 class GraphState(BaseModel):

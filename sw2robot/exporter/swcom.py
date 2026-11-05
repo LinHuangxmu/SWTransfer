@@ -5,10 +5,14 @@ KEY FACTS about this machine (discovered empirically):
 * The user's running SolidWorks does NOT register itself in the COM Running
   Object Table, so ``win32com.client.GetActiveObject("SldWorks.Application")``
   fails with ``MK_E_UNAVAILABLE`` and we cannot attach to the live session.
-* Every ``Dispatch("SldWorks.Application")`` spawns a *new* SolidWorks process
-  (the class object is single-use).  Therefore this module always creates and
-  OWNS its own instance and is responsible for shutting it down (``ExitApp``)
-  so it never leaks empty instances.
+* ``Dispatch("SldWorks.Application")`` spawns a *new* SolidWorks process only
+  when none is running; this module then OWNS it and shuts it down
+  (``ExitApp``) so it never leaks empty instances.  While ANY SolidWorks runs
+  -- started by the user from the Start menu or by another tool over COM --
+  Dispatch hands back THAT process (measured on SolidWorks 2024).  Ownership is
+  therefore decided by process id: a session that got an already-running
+  process works inside it like an attached one and never closes its
+  documents, hides it or quits it (see ``SolidWorks.__init__``).
 * We open the target file **read-only** and **never save** it, so the user's
   open document is never at risk.
 * The COM client must be an **x64** Python to match SolidWorks (the project is
@@ -18,6 +22,7 @@ KEY FACTS about this machine (discovered empirically):
 from __future__ import annotations
 
 import contextlib
+import ntpath
 import os
 import shutil
 import sys
@@ -55,6 +60,80 @@ _TESTED_MAJOR = 32                  # SolidWorks 2024 (year - 1992); the verifie
 _ISSUES_URL = "https://github.com/iory/sw2robot/issues"
 _sld_module = None
 _swconst_module = None
+
+
+def _win_path_key(path):
+    """``path`` normalised for comparing SolidWorks document paths: Windows
+    paths are case-insensitive and accept either separator.  ``ntpath`` so the
+    comparison is the same when this module is imported off Windows."""
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def _local_file(folder, name):
+    """Path of the file ``name`` in ``folder`` or one of its direct
+    sub-folders (case-insensitive), or None."""
+    want = name.lower()
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    subdirs = []
+    for e in entries:
+        p = os.path.join(folder, e)
+        if e.lower() == want and os.path.isfile(p):
+            return p
+        if os.path.isdir(p):
+            subdirs.append(p)
+    for d in subdirs:
+        try:
+            for e in sorted(os.listdir(d)):
+                p = os.path.join(d, e)
+                if e.lower() == want and os.path.isfile(p):
+                    return p
+        except OSError:
+            continue
+    return None
+
+
+def sldworks_pids():
+    """PIDs of every running SLDWORKS.exe, or None when they cannot be listed
+    (non-Windows, tasklist failure) -- unknown, which is not the same as none."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq SLDWORKS.exe", "/FO", "CSV",
+             "/NH"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    pids = set()
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower().startswith("sldworks"):
+            try:
+                pids.add(int(parts[1]))
+            except ValueError:
+                pass
+    return pids
+
+
+def _owns_new_process(pid, before):
+    """Whether Dispatch started a NEW SolidWorks: its ``pid`` was not running
+    ``before``.  Unknowns decide for "shared", since wrongly owning means
+    closing someone's documents unsaved and quitting their SolidWorks."""
+    if before is None:
+        return False
+    if pid is None:
+        return not before          # nothing was running, so it must be ours
+    return pid not in before
+
+
+def _com_pid(app):
+    """Process id of the SolidWorks behind ``app`` (ISldWorks.GetProcessID),
+    or None."""
+    try:
+        return int(safe_call(app, "GetProcessID"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _registered_typelib_versions(libid):
@@ -330,6 +409,27 @@ class SolidWorksUnavailable(RuntimeError):
     restored."""
 
 
+class NamesakeOpenError(RuntimeError):
+    """The session already holds a file NAMED like one this assembly uses, but
+    from another folder.  SolidWorks keeps one document per file name and
+    resolves every reference to an in-memory match before looking on disk, so
+    extracting here would silently read the other folder's geometry and mass,
+    and no option of the session changes that.  ``conflicts`` is
+    ``[(path open in the session, the assembly's own file), ...]``."""
+
+    def __init__(self, conflicts):
+        self.conflicts = list(conflicts)
+        shown = "; ".join(f"{o} is open, the assembly uses {r}"
+                          for o, r in self.conflicts[:3])
+        more = len(self.conflicts) - 3
+        super().__init__(
+            "SolidWorks already has a same-named file from another folder "
+            f"open ({shown}" + (f"; +{more} more" if more > 0 else "")
+            + "). SolidWorks would use that file instead of the assembly's "
+            "own. Close the document that holds it, or extract with "
+            "SolidWorks closed, then retry.")
+
+
 class SolidWorksTypelibError(SolidWorksUnavailable):
     """The SolidWorks API type library could not be loaded for the installed
     version.  The version is auto-detected, but this build is only verified
@@ -462,6 +562,7 @@ class SolidWorks:
         except Exception:
             pass
         _require_typelibs()  # load typelibs first so Dispatch returns typed
+        before = sldworks_pids()
         try:
             self.app = win32com.client.gencache.EnsureDispatch(
                 "SldWorks.Application")
@@ -485,10 +586,21 @@ class SolidWorks:
                 print("  [swcom] WARNING: OpenDoc6 still unavailable -- makepy "
                       "could not generate the typelib wrapper (frozen build "
                       "with no writable gen_py?)")
-        try:
-            self.app.Visible = visible
-        except Exception:
-            pass
+        pid = _com_pid(self.app)
+        self._shared = not _owns_new_process(pid, before)
+        if self._shared:
+            # someone else's SolidWorks: work in it like an attached session --
+            # keep its window as it is, and never close its documents or quit
+            print(f"  [swcom] SolidWorks handed back an already-running "
+                  f"process (pid {pid if pid is not None else 'unknown'}) "
+                  f"instead of a new one; working in it without closing its "
+                  f"documents or quitting it")
+            visible = bool(safe_prop(self.app, "Visible"))
+        else:
+            try:
+                self.app.Visible = visible
+            except Exception:
+                pass
         self.visible = visible
         self._open_docs = []
         self._tempdirs = []
@@ -566,6 +678,10 @@ class SolidWorks:
                     self._reused_titles.add(str(title))
                 doc = existing
         t1 = t0
+        if doc is None and doc_type_for(path) == SW_DOC_ASSEMBLY:
+            conflicts = self._namesake_conflicts(path)
+            if conflicts:
+                raise NamesakeOpenError(conflicts)
         if doc is None:
             # A temp copy loses SolidWorks' "same folder as the assembly"
             # reference-resolution rule; assemblies whose STORED part paths are
@@ -810,32 +926,29 @@ class SolidWorks:
             pass
 
     def _find_open_doc(self, path):
-        """An already-open ModelDoc2 whose title matches ``path``'s file name, or
-        None.  Lets a reused session extract from the user's resolved document
-        instead of opening a (possibly unresolvable) copy."""
-        want_path = os.path.normcase(os.path.abspath(path))
-        want = os.path.splitext(os.path.basename(path))[0].lower()
+        """The already-open ModelDoc2 of the file at ``path``, or None.  Lets a
+        reused session extract from the user's resolved document instead of
+        opening a (possibly unresolvable) copy.
 
-        def matches(d):
-            if d is None:
-                return False
-            # ActiveDoc is more reliable than GetDocuments on some SolidWorks
-            # releases (and when the user has an assembly open in lightweight
-            # or flexible mode).  Prefer an exact path, then fall back to the
-            # historical title comparison for unsaved/copy documents.
-            raw_path = safe_prop(d, "GetPathName")
-            if raw_path:
-                try:
-                    if os.path.normcase(os.path.abspath(str(raw_path))) == want_path:
-                        return True
-                except Exception:
-                    pass
+        Matched on the document's full path: two folders often hold an
+        assembly of the same name (a Pack and Go, a variant, a backup), and a
+        title match would extract the OTHER one.  The title is compared only
+        when SolidWorks reports no path for a document."""
+        want_path = _win_path_key(path)
+        want = os.path.splitext(ntpath.basename(path))[0].lower()
+        for d in self._session_docs():
+            doc_path = safe_prop(d, "GetPathName")
+            if doc_path:
+                if _win_path_key(str(doc_path)) == want_path:
+                    return d
+                continue
             title = safe_prop(d, "GetTitle") or ""
-            return os.path.splitext(os.path.basename(str(title)))[0].lower() == want
+            if os.path.splitext(str(title))[0].lower() == want:
+                return d
+        return None
 
-        active = safe_prop(self.app, "ActiveDoc")
-        if matches(active):
-            return active
+    def _session_docs(self):
+        """Every ModelDoc2 open in this SolidWorks session."""
         docs = safe_call(self.app, "GetDocuments")
         if docs is None:
             # fall back to the linked-list walk on versions without GetDocuments
@@ -846,10 +959,63 @@ class SolidWorks:
                 docs.append(d)
                 d = safe_call(d, "GetNext")
                 seen += 1
-        for d in (docs or []):
-            if matches(d):
-                return d
-        return None
+        return list(docs or [])
+
+    def _session_files(self):
+        """``{file name (lower): {path, ...}}`` of every file this session
+        holds in memory: the open documents AND every component of the open
+        assemblies.  A component loaded lightweight has no document of its
+        own (GetDocuments omits it), yet SolidWorks still resolves a
+        same-named reference to it."""
+        out = {}
+
+        def add(p):
+            if p:
+                out.setdefault(ntpath.basename(str(p)).lower(),
+                               set()).add(str(p))
+
+        for d in self._session_docs():
+            add(safe_prop(d, "GetPathName"))
+            # a part has no components: GetComponents fails -> None -> []
+            asm = as_iface(d, "IAssemblyDoc")
+            for c in list(safe_call(asm, "GetComponents", False) or []):
+                add(safe_prop(as_iface(c, "IComponent2"), "GetPathName"))
+        return out
+
+    def _namesake_conflicts(self, path):
+        """``[(path in the session, the assembly's own file), ...]`` for files
+        this session holds (see :meth:`_session_files`) that share a name with
+        a file the assembly at ``path`` uses but are not that file.
+
+        The assembly's own file is the same-named file in its folder (or a
+        direct sub-folder), else the path its dependency records give.  Those
+        records alone cannot decide: once a namesake is in memory,
+        ``GetDocumentDependencies2`` reports the in-memory path."""
+        held = self._session_files()
+        if not held:
+            return []
+        try:
+            deps = list(self.app.GetDocumentDependencies2(
+                path, True, False, False) or [])
+        except Exception as e:
+            print(f"      WARN: GetDocumentDependencies2 failed ({e!r}); "
+                  f"cannot check for same-named files already open")
+            return []
+        out = []
+        for ref in dict.fromkeys(str(r) for r in deps[1::2] if r):
+            name = ntpath.basename(ref)
+            open_paths = held.get(name.lower())
+            if not open_paths:
+                continue
+            own = _local_file(ntpath.dirname(path), name)
+            if own is None and os.path.isfile(ref):
+                own = ref
+            if own is None:
+                continue                  # nothing on disk to compare with
+            for o in sorted(open_paths):
+                if _win_path_key(o) != _win_path_key(own):
+                    out.append((o, own))
+        return out
 
     def close_doc(self, doc):
         title = safe_prop(doc, "GetTitle")
@@ -872,25 +1038,30 @@ class SolidWorks:
     def shutdown(self):
         """Close all docs WITHOUT saving and terminate OUR instance only.
 
-        In attach mode the application belongs to the USER: never close
-        documents or exit -- just drop our reference."""
+        In attach mode, or when Dispatch handed back an already-running
+        process, the application belongs to someone else: close only the
+        copies we opened, never their documents, and do not exit."""
         self._end_api_batch()
         self._restore_search_folders()
-        if getattr(self, "_attached", False):
-            self.app = None
-            return
-        try:
-            # True == include unsaved; we opened read-only so nothing is dirty,
-            # but this guarantees no save prompt blocks the headless run.
-            self.app.CloseAllDocuments(True)
-        except Exception:
-            pass
-        try:
-            self.app.ExitApp()
-        except Exception:
-            pass
+        if getattr(self, "_attached", False) or getattr(self, "_shared", False):
+            for doc in list(getattr(self, "_open_docs", [])):
+                self.close_doc(doc)
+            self._open_docs = []
+        else:
+            try:
+                # True == include unsaved; we opened read-only so nothing is
+                # dirty, but this guarantees no save prompt blocks the run.
+                self.app.CloseAllDocuments(True)
+            except Exception:
+                pass
+            try:
+                self.app.ExitApp()
+            except Exception:
+                pass
         self.app = None
-        for d in self._tempdirs:
+        # a part a copy pulled in may stay loaded in a session we do not own,
+        # keeping its file locked -- whatever cannot be removed is left
+        for d in getattr(self, "_tempdirs", []):
             shutil.rmtree(d, ignore_errors=True)
         self._tempdirs = []
 

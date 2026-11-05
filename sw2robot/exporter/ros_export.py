@@ -27,6 +27,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import threading
 import xml.etree.ElementTree as ET
 
@@ -36,28 +37,100 @@ from skrobot.utils.convex_decomposition import (
     is_coacd_available,
 )
 
+from . import pbr as _pbr
 from .geometry import (
     fmt_urdf_num,
     fmt_urdf_vec,
     set_urdf_origin,
+    urdf_link_world_poses,
     urdf_origin_matrix,
 )
 from .urdf_writer import (
     CMAKELISTS,
     CMAKELISTS_ROS2,
     CMAKELISTS_ROS2_COUPLED,
+    CONTROL_LAUNCH_ROS2,
     DISPLAY_LAUNCH_ROS2,
     DISPLAY_LAUNCH_ROS2_COUPLED,
     LOOP_COUPLING_RELAY_PY,
     PACKAGE_XML,
     PACKAGE_XML_ROS2,
     PACKAGE_XML_ROS2_COUPLED,
+    ROS2_CONTROL_URDF_XACRO,
+    ROS2_CONTROL_XACRO,
     RVIZ_CONFIG_ROS2,
 )
 
 # fallback <material> colour for an STL <visual> with no per-link override (STL
 # carries no colour, so without this RViz would show the link in its default grey)
 _DEFAULT_VISUAL_RGBA = (191, 191, 191, 255)   # neutral light grey (~0.75)
+
+
+def _ros2_control_files(urdf_text, root, pkg, urdf_stem):
+    """``[(arc, bytes)]``: the xacro and ros2_control half of a ROS 2 package.
+
+    ``urdf/<stem>.urdf.xacro`` is the robot as a macro (skrobot's
+    modularize-urdf: ``prefix`` on every name, a ``parent_link`` to hang it
+    from), ``urdf/<stem>.ros2_control.xacro`` a position interface for each
+    joint a controller can drive, and ``urdf/<stem>_control.urdf.xacro`` +
+    ``config/ros2_controllers.yaml`` + ``launch/control.launch.py`` run the two
+    under controller_manager.  A mimic joint follows its leader and a fixed one
+    does not move, so neither gets an interface."""
+    from lxml import etree
+    from skrobot.urdf import transform_urdf_to_macro
+    from skrobot.urdf.modularize_urdf import find_root_link
+    from skrobot.urdf.ros_config import generate_controllers_yaml, parse_urdf_content
+    from skrobot.urdf.ros_config.gazebo_generator import build_ros2_control_elements
+
+    # the macro name becomes an XML tag (<xacro:NAME>), which cannot start
+    # with a digit the way a URDF file stem may
+    macro = re.sub(r"\W", "_", urdf_stem)
+    if not re.match(r"[A-Za-z_]", macro):
+        macro = "_" + macro
+    fd, tmp = tempfile.mkstemp(suffix=".urdf")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(urdf_text)
+        xacro_root, _name = transform_urdf_to_macro(
+            tmp, find_root_link(tmp), no_prefix=False, macro_name=macro)
+    finally:
+        os.remove(tmp)
+    robot_xacro = etree.tostring(xacro_root, pretty_print=True,
+                                 xml_declaration=True, encoding="utf-8")
+
+    driven = [j for j in parse_urdf_content(urdf_text)["joints"]
+              if j["type"] in ("revolute", "continuous", "prismatic")
+              and not j["is_mimic"]]
+    joints = [j["name"] for j in driven]
+    # every name is ${prefix}-ed and the plugin is a xacro parameter, so the
+    # macro can be instantiated twice and pointed at real hardware
+    ros2_control, _gazebo = build_ros2_control_elements(
+        ["${prefix}" + n for n in joints], package_name=pkg,
+        name="${prefix}" + macro, hardware_plugin="${plugin}",
+        joint_limits={"${prefix}" + j["name"]: (j["lower_limit"],
+                                                j["upper_limit"])
+                      for j in driven if j["type"] != "continuous"
+                      and j["lower_limit"] < j["upper_limit"]})
+    ET.indent(ros2_control, space="  ", level=2)
+    controllers = generate_controllers_yaml(
+        [{"name": "joint_trajectory_controller", "joints": joints}]
+        if joints else [])
+    spawn = ', "joint_trajectory_controller"' if joints else ""
+    return [
+        (f"{pkg}/urdf/{urdf_stem}.urdf.xacro", robot_xacro),
+        (f"{pkg}/urdf/{urdf_stem}.ros2_control.xacro",
+         ROS2_CONTROL_XACRO.format(
+             macro=macro,
+             ros2_control=ET.tostring(ros2_control, encoding="unicode"))
+         .encode("utf-8")),
+        (f"{pkg}/urdf/{urdf_stem}_control.urdf.xacro",
+         ROS2_CONTROL_URDF_XACRO.format(name=pkg, robot=urdf_stem, macro=macro)
+         .encode("utf-8")),
+        (f"{pkg}/config/ros2_controllers.yaml", controllers.encode("utf-8")),
+        (f"{pkg}/launch/control.launch.py",
+         CONTROL_LAUNCH_ROS2.format(name=pkg, robot=urdf_stem, spawn=spawn)
+         .encode("utf-8")),
+    ]
 
 
 def _loop_closures_yaml(closures):
@@ -82,7 +155,17 @@ def _load_mesh_metres(src):
     any scene to a single geometry, and return it pinned to metres."""
     import trimesh
 
-    loaded = trimesh.load(src)
+    loaded = None
+    if str(src).lower().endswith(".3dxml"):
+        # without its texture images, or trimesh may drop every face colour of
+        # a part with a textured face (see textures.colour_only_3dxml); the
+        # images are read from the original file by the glb writer
+        from . import textures as _textures
+        plain = _textures.colour_only_3dxml(src)
+        if plain is not None:
+            loaded = trimesh.load(plain, file_type="3dxml")
+    if loaded is None:
+        loaded = trimesh.load(src)
     if isinstance(loaded, trimesh.Scene):
         # to_geometry() is trimesh's current single-mesh flatten; fall back to
         # the older dump() on versions that predate it
@@ -145,7 +228,7 @@ def _baked(mesh, transform):
     return mesh
 
 
-def _mesh_to_dae_bytes(src, color=None, transform=None, mesh=None):
+def _mesh_to_dae_bytes(src, color=None, transform=None, mesh=None, pbr=None):
     """COLLADA (.dae) bytes in metres, with colours baked into materials.
     ``color`` (``'#RRGGBB'``) overrides the mesh's own colours; ``transform``
     (4x4) is baked into the vertices so the URDF origin can be zeroed.  ``mesh``
@@ -159,7 +242,7 @@ def _mesh_to_dae_bytes(src, color=None, transform=None, mesh=None):
     return export_collada(meshes)
 
 
-def _mesh_to_stl_bytes(src, color=None, transform=None, mesh=None):
+def _mesh_to_stl_bytes(src, color=None, transform=None, mesh=None, pbr=None):
     """STL bytes in metres (colour is dropped -- collision geometry needs none,
     so ``color`` is accepted for a uniform converter signature but ignored).
     ``transform`` (4x4) is baked into the vertices.  ``mesh`` (preloaded) skips
@@ -168,14 +251,43 @@ def _mesh_to_stl_bytes(src, color=None, transform=None, mesh=None):
     return _baked(m, transform).export(file_type="stl")
 
 
-def _mesh_to_glb_bytes(src, color=None, transform=None, mesh=None):
+def _mesh_to_glb_bytes(src, color=None, transform=None, mesh=None, pbr=None):
     """GLB bytes in metres, keeping the original material/texture (for
-    three.js / skrobot consumers, not RViz).  ``color`` (``'#RRGGBB'``)
-    overrides the mesh's own colours; ``transform`` (4x4) is baked in.  ``mesh``
-    (preloaded) skips the per-call ``trimesh.load``."""
+    three.js / skrobot / Isaac Sim consumers, not RViz).  ``color``
+    (``'#RRGGBB'``) overrides the mesh's own colours; ``transform`` (4x4) is
+    baked in.  ``mesh`` (preloaded) skips the per-call ``trimesh.load``.
+
+    ``pbr`` -- ``{"metallic", "roughness"[, "preset"]}`` from
+    :func:`pbr.resolve` -- turns the mesh into one primitive per colour, each
+    with a glTF PBR material (``baseColorFactor`` = that colour, the given
+    metallic / roughness), so every loader keeps both the colours and the
+    finish; see :func:`pbr.glb_with_materials`.  Without it the file carries
+    vertex colours and no material (which the glTF spec renders as a fully
+    rough metal).
+
+    Faces textured in SolidWorks (a ``.3dxml`` source, no ``color`` override)
+    keep their image: they become primitives with a ``baseColorTexture`` and the
+    part's finish (``pbr``, or the ``default`` preset when none is given) --
+    see :mod:`sw2robot.exporter.textures`."""
     m = mesh if mesh is not None else _load_mesh_metres(src)
-    return _apply_uniform_color(_baked(m, transform), color).export(
-        file_type="glb")
+    textured = []
+    if color is None and str(src).lower().endswith(".3dxml"):
+        from . import textures as _textures
+        patches = _textures.read_3dxml_textures(src)
+        if patches:
+            m, textured = _textures.split_textured(m, patches)
+            for piece in textured:
+                _baked(piece, transform)
+    if m is not None:
+        m = _apply_uniform_color(_baked(m, transform), color)
+    if textured:
+        finish = pbr or _pbr.resolve()
+        return _pbr.glb_with_materials(m, finish["metallic"], finish["roughness"],
+                                       name=finish.get("preset"), textured=textured)
+    if pbr:
+        return _pbr.glb_with_materials(m, pbr["metallic"], pbr["roughness"],
+                                       name=pbr.get("preset"))
+    return m.export(file_type="glb")
 
 
 _CONVERT = {"dae": _mesh_to_dae_bytes, "stl": _mesh_to_stl_bytes,
@@ -185,6 +297,13 @@ _CONVERT = {"dae": _mesh_to_dae_bytes, "stl": _mesh_to_stl_bytes,
 _CTX_FMT = (("visual", "dae"), ("collision", "stl"))
 # a uniform GLB variant (both contexts) for native-mesh / three.js consumers
 GLB_CTX_FMT = (("visual", "glb"), ("collision", "glb"))
+# Isaac Sim: PBR .glb visuals (consumed by scikit-robot urdf_to_usd; Isaac Sim 6.0
+# own URDF importer drops glb materials), plain .stl collision
+ISAAC_CTX_FMT = (("visual", "glb"), ("collision", "stl"))
+#: how ``<mesh filename>`` is written: ``package`` (``package://<pkg>/...``,
+#: ROS) or ``relative`` (``../<mesh_dir>/...`` from the URDF file, what Isaac
+#: Sim's importer and most non-ROS loaders resolve without a package path)
+URL_STYLES = ("package", "relative")
 
 
 # ----------------------------------------------------------- mesh cache + reuse
@@ -249,7 +368,10 @@ def _atomic_write(path, data):
 
 # bump when the converted-bytes / measurement cache layout changes (stale caches
 # under a previous version are then ignored rather than mis-read)
-_MESH_CACHE_VERSION = 1
+# -- v2: glb visuals carry per-colour PBR materials instead of COLOR_0
+# -- v3: faces textured in SolidWorks keep their image in the glb
+# -- v4: a part with textured faces keeps its other faces' colours
+_MESH_CACHE_VERSION = 4
 
 
 class _MeshCache:
@@ -313,13 +435,15 @@ class _MeshCache:
             pass
         return size, centroid
 
-    def convert(self, src, fmt, color, transform):
+    def convert(self, src, fmt, color, transform, pbr=None):
         """Converted mesh bytes (``_CONVERT[fmt]``), disk-cached by source content
         + conversion params so a re-export skips the trimesh re-conversion."""
         tkey = None if transform is None else tuple(
             round(float(x), 7) for x in transform.flatten())
+        pkey = None if not pbr else [pbr["metallic"], pbr["roughness"],
+                                     pbr.get("preset")]
         h = hashlib.sha1(self.sha(src).encode())
-        h.update(json.dumps([fmt, color, tkey, _MESH_CACHE_VERSION],
+        h.update(json.dumps([fmt, color, tkey, pkey, _MESH_CACHE_VERSION],
                             sort_keys=True).encode())
         path = os.path.join(self._cache_dir, f"{h.hexdigest()[:16]}.{fmt}")
         try:
@@ -328,7 +452,7 @@ class _MeshCache:
         except OSError:
             pass
         data = _CONVERT[fmt](src, color=color, transform=transform,
-                             mesh=self.copy(src))
+                             mesh=self.copy(src), pbr=pbr)
         try:
             _atomic_write(path, data)
         except OSError:
@@ -553,6 +677,44 @@ def _tf_marker_scale(root, pkg_dir, own_pkgs, cache):
         return 1.0
     sizes.sort()
     return round(min(1.0, max(0.02, sizes[len(sizes) // 2])), 4)
+
+
+def _rviz_view(root, pkg_dir, own_pkgs, cache):
+    """RViz grid cell + orbit camera that frame the whole model at zero pose.
+
+    Each visual mesh counts as a ball (its centroid, half its bounding-box
+    diagonal) placed by the zero-pose link frames; the camera looks at the
+    centre of their union box from 1.8x its diagonal, and the grid cell is the
+    power of ten below that diagonal.  Returns the template's format fields
+    (RViz's own 1 m cell / 10 m view at the origin when nothing measures)."""
+    import numpy as np
+    poses = urdf_link_world_poses(root)
+    lo = hi = None
+    for link in root.findall("link"):
+        for vis in link.findall("visual"):
+            me = vis.find(".//mesh")
+            if me is None:
+                continue
+            _b, src, _e = _resolve_mesh(pkg_dir, me.get("filename"),
+                                        own_pkgs=own_pkgs)
+            res = cache.measure(src) if src is not None else None
+            if res is None or res[0] <= 0.0:
+                continue
+            size, centroid = res
+            M = poses.get(link.get("name"), np.eye(4)) \
+                @ urdf_origin_matrix(vis.find("origin"))
+            c = (M @ np.append(centroid, 1.0))[:3]
+            lo = c - size / 2 if lo is None else np.minimum(lo, c - size / 2)
+            hi = c + size / 2 if hi is None else np.maximum(hi, c + size / 2)
+    if lo is None:
+        return {"cell_size": 1, "distance": 10, "fx": 0, "fy": 0, "fz": 0}
+    diag = float(np.linalg.norm(hi - lo))
+    focal = (lo + hi) / 2
+    return {"cell_size": fmt_urdf_num(10.0 ** np.floor(np.log10(diag))),
+            "distance": fmt_urdf_num(round(1.8 * diag, 4)),
+            "fx": fmt_urdf_num(round(float(focal[0]), 4)),
+            "fy": fmt_urdf_num(round(float(focal[1]), 4)),
+            "fz": fmt_urdf_num(round(float(focal[2]), 4))}
 
 
 def _bake_origins(root, pkg_dir, own_pkgs, cache):
@@ -1045,7 +1207,8 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                           collision="copy",
                           coacd_quality="balanced", merge_fixed=False,
                           mesh_dir=None, loop_closures=None,
-                          zero_origins=True, progress=None, should_cancel=None):
+                          zero_origins=True, progress=None, should_cancel=None,
+                          materials=None, url_style="package"):
     """``pkg_dir`` (a built package) -> ``[(arcname, bytes), ...]`` for a portable
     ROS package, all behind ``package://`` URLs.  The package is named
     ``pkg_name`` if given (validated, see :func:`ros_pkg_name`), else
@@ -1069,6 +1232,16 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
     mesh basename equals the component link name) that repaints that link's
     ``<visual>`` mesh a solid colour, overriding its CAD colours; collision STL
     is colourless and unaffected.
+
+    ``materials`` is an optional ``{link name -> preset | {metallic, roughness}}``
+    map of PBR overrides for ``glb`` visuals (see :mod:`pbr`); a link without
+    one gets its finish from the SolidWorks appearance / material recorded in
+    its ``<!-- sw2robot ... -->`` comment, else the default.  Only ``glb``
+    output carries it: ``.dae`` and ``.stl`` have no PBR to write.
+
+    ``url_style`` -- ``"package"`` (default) writes ``package://<pkg>/...``
+    mesh refs, ``"relative"`` writes ``../<mesh_dir>/...`` relative to the
+    URDF file (Isaac Sim, plain loaders).
 
     ``collision`` chooses how ``<collision>`` geometry is produced: ``'copy'``
     (default) reuses the visual mesh as one STL (the current behaviour);
@@ -1115,6 +1288,10 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
     boundary)."""
     if ros_version not in (1, 2):
         raise ValueError(f"unsupported ros_version: {ros_version}")
+    if url_style not in URL_STYLES:
+        raise ValueError(f"unsupported url_style: {url_style!r} "
+                         f"(use one of {URL_STYLES})")
+    materials = materials or {}
     if collision not in COLLISION_MODES:
         raise ValueError(f"unsupported collision mode: {collision!r} "
                          f"(use one of {COLLISION_MODES})")
@@ -1151,6 +1328,11 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
     urdf_stem = ros_urdf_stem(pkg, urdf_name)
     robot_tag_name = ros_robot_tag(urdf_stem, robot_tag)
     mesh_rel = ros_mesh_dir(mesh_dir)
+
+    def _mesh_url(name):
+        if url_style == "relative":
+            return f"../{mesh_rel}/{name}"
+        return f"package://{pkg}/{mesh_rel}/{name}"
     # the opened package's own name(s) -- only package:// refs to one of these
     # are vendored/repointed; refs to other ROS packages are left untouched
     own_pkgs = _own_pkg_names(pkg_dir)
@@ -1186,6 +1368,9 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
     cache = _MeshCache(os.path.join(pkg_dir, "meshes", ".mesh_cache"))
     # bake visual/collision origins into meshes (-> origin 0 0 0, MuJoCo-ready)
     # and re-centre fixed links on their geometry; {id(mesh_el): 4x4 transform}
+    # framed before the baking below moves any link frame (world poses do not
+    # change, but the visual origins it reads are zeroed)
+    rviz_view = _rviz_view(root, pkg_dir, own_pkgs, cache)
     if zero_origins:
         bake, tf_scale = _bake_origins(root, pkg_dir, own_pkgs, cache)
     else:
@@ -1274,8 +1459,7 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                 nb = copy.deepcopy(block)
                 if m_bake is not None:         # parts are in the source frame:
                     set_urdf_origin(nb, m_bake)  # carry the bake transform here
-                next(nb.iter("mesh")).set(
-                    "filename", f"package://{pkg}/{mesh_rel}/{name}")
+                next(nb.iter("mesh")).set("filename", _mesh_url(name))
                 link.insert(idx + k, nb)
 
     def _fit_primitive_cached(base, src):
@@ -1381,7 +1565,8 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
         # already the target format, no colour override, no bake: the source is
         # shipped byte-for-byte (no trimesh round-trip), so it needs no load
         return (job["src"].lower().endswith(f".{job['fmt']}")
-                and not job["color"] and job["transform"] is None)
+                and not job["color"] and job["transform"] is None
+                and not job.get("pbr"))
 
     # ---- phase 1: plan conversions, allocating names in tree order -----------
     # one job per unique (src, fmt, colour, bake) key; mesh elements sharing a key
@@ -1396,6 +1581,12 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
         # colour overrides are keyed by LINK name in URDF-input mode and by the
         # component/mesh basename in the CAD path -- accept either
         link_color = colors.get(link.get("name"))
+        # PBR finish for a glb <visual>: an explicit override by link name,
+        # else from the appearance / material the extract recorded on the link
+        prov = _pbr.provenance(link)
+        link_pbr = _pbr.resolve(appearance=prov.get("appearance"),
+                                material=prov.get("material"),
+                                override=materials.get(link.get("name")))
         if collision in ("coacd", "hull"):
             _expand_collision(link)
         elif collision in _PRIMITIVE_MODES:
@@ -1416,7 +1607,20 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                     transform = bake.get(id(mesh))
                     tkey = None if transform is None else tuple(
                         round(float(x), 7) for x in transform.flatten())
-                    key = (os.path.abspath(src), fmt, color, tkey)
+                    # every glb (collision too, so a uniform-glb package keeps
+                    # one file per part: a collision loader ignores materials)
+                    pbr = None
+                    if fmt == "glb":
+                        pbr = link_pbr
+                        if link.get("name") not in materials \
+                                and base in materials:
+                            pbr = _pbr.resolve(
+                                appearance=prov.get("appearance"),
+                                material=prov.get("material"),
+                                override=materials.get(base))
+                    pkey = None if pbr is None else (
+                        pbr["metallic"], pbr["roughness"], pbr["preset"])
+                    key = (os.path.abspath(src), fmt, color, tkey, pkey)
                     job = jobs.get(key)
                     if job is None:
                         name, i = f"{base}.{fmt}", 1
@@ -1426,10 +1630,9 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                         used_names.add(name)
                         job = jobs[key] = {"base": base, "src": src, "fmt": fmt,
                                            "color": color, "transform": transform,
-                                           "name": name}
+                                           "pbr": pbr, "name": name}
                         job_order.append(key)
-                    mesh.set("filename",
-                             f"package://{pkg}/{mesh_rel}/{job['name']}")
+                    mesh.set("filename", _mesh_url(job["name"]))
                     # STL carries no colour, so a <visual> STL would render grey
                     # in RViz.  Emit a URDF <material> instead: the per-link colour
                     # override if set, else a default colour.  dae/glb keep their
@@ -1478,7 +1681,8 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                                 files.append((arc, fh.read()))
                             used_names.add(arc)
             else:
-                data = cache.convert(src, fmt, color, transform)
+                data = cache.convert(src, fmt, color, transform,
+                                     pbr=job.get("pbr"))
         except Exception as e:
             errors.append(f"{job['base']}: {fmt} convert failed ({e!r})")
             continue
@@ -1513,8 +1717,9 @@ def build_ros_description(pkg_dir, robot_name, email="auto@example.com",
                       launch.format(name=pkg, robot=urdf_stem).encode("utf-8")))
         files.append((f"{pkg}/rviz/{urdf_stem}.rviz",
                       RVIZ_CONFIG_ROS2.format(fixed_frame=fixed_frame,
-                                              tf_scale=tf_scale)
+                                              tf_scale=tf_scale, **rviz_view)
                       .encode("utf-8")))
+        files.extend(_ros2_control_files(new_urdf, root, pkg, urdf_stem))
         if coupled:
             files.append((f"{pkg}/config/loop_closures.yaml",
                           _loop_closures_yaml(loop_closures).encode("utf-8")))
@@ -1535,7 +1740,8 @@ def write_ros_description_package(pkg_dir, robot_name, dest_dir,
                                   collision="copy",
                                   coacd_quality="balanced",
                                   merge_fixed=False, mesh_dir=None,
-                                  loop_closures=None, zero_origins=True):
+                                  loop_closures=None, zero_origins=True,
+                                  ctx_fmt=None, materials=None):
     """Write the ROS package under ``dest_dir`` and return its directory path.
     The package is named ``pkg_name`` if given, else ``<robot_name>_description``;
     the URDF inside is named ``urdf_name`` if given, else the package name, and
@@ -1544,7 +1750,9 @@ def write_ros_description_package(pkg_dir, robot_name, dest_dir,
     overrides), ``collision`` / ``coacd_quality`` (CoACD collision-mesh
     decomposition), ``merge_fixed`` (lump fixed-joint children into parents),
     ``mesh_dir`` (package-relative mesh directory, default ``meshes``) and
-    ``loop_couplings`` (ROS 2 closed-loop relay node + config) are passed
+    ``loop_couplings`` (ROS 2 closed-loop relay node + config), ``ctx_fmt``
+    (per-context mesh format, default ``.dae`` visual + ``.stl`` collision)
+    and ``materials`` (per-link PBR overrides for ``glb`` visuals) are passed
     through to :func:`build_ros_description`."""
     pkg = ros_pkg_name(robot_name, pkg_name)
     files = build_ros_description(pkg_dir, robot_name, email=email,
@@ -1555,7 +1763,14 @@ def write_ros_description_package(pkg_dir, robot_name, dest_dir,
                                   coacd_quality=coacd_quality,
                                   merge_fixed=merge_fixed, mesh_dir=mesh_dir,
                                   loop_closures=loop_closures,
-                                  zero_origins=zero_origins)
+                                  zero_origins=zero_origins,
+                                  ctx_fmt=ctx_fmt or _CTX_FMT,
+                                  materials=materials)
+    _write_files(dest_dir, files)
+    return os.path.join(os.path.abspath(dest_dir), pkg)
+
+
+def _write_files(dest_dir, files):
     root = os.path.abspath(dest_dir)
     for arc, data in files:
         dst = os.path.join(root, *arc.split("/"))
@@ -1568,4 +1783,61 @@ def write_ros_description_package(pkg_dir, robot_name, dest_dir,
         # entry that `ros2 launch` cannot find
         if "/scripts/" in arc and arc.endswith(".py"):
             os.chmod(dst, 0o755)
-    return os.path.join(root, pkg)
+
+
+ISAAC_README = """# {pkg}
+
+A URDF for NVIDIA Isaac Sim, written by sw2robot.
+
+* `urdf/{urdf}.urdf` -- mesh references are RELATIVE to this file
+  (`../meshes/...`), so no ROS package path is needed.
+* `meshes/*.glb` -- the <visual> meshes, one glTF primitive per CAD colour,
+  each with a PBR material (baseColorFactor = that colour; metallic /
+  roughness from the part's SolidWorks appearance or material, or a
+  `materials:` override).
+* `meshes/*.stl` -- the <collision> meshes (no colour, as collision needs none).
+
+To get it into Isaac Sim WITH the finishes, convert the URDF to USD with
+scikit-robot (`skrobot.export.usd.urdf_to_usd`, which binds a
+UsdPreviewSurface per finish) and open that USD.  Isaac Sim 6.0's own URDF
+importer accepts the glb geometry but writes the meshes with no material and
+no colour.  Add a dome light with an HDRI before judging the metals: a PBR
+metal shows only what it reflects.
+"""
+
+
+def write_isaac_package(pkg_dir, robot_name, dest_dir, pkg_name=None,
+                        urdf_name=None, robot_tag=None, colors=None,
+                        materials=None, collision="copy",
+                        coacd_quality="balanced", merge_fixed=False,
+                        mesh_dir=None, zero_origins=True):
+    """Write an Isaac Sim package under ``dest_dir``; return its directory.
+
+    The layout is the ROS description package's (``urdf/`` + ``meshes/``)
+    without ``package.xml`` / ``CMakeLists.txt`` -- Isaac Sim is not a ROS
+    workspace -- with ``<mesh filename>`` relative to the URDF file, ``.glb``
+    visuals that carry a PBR material (:data:`ISAAC_CTX_FMT`, :mod:`pbr`) and
+    ``.stl`` collision.  The package is named ``pkg_name`` if given, else
+    ``<robot_name>_isaac``; ``urdf_name`` / ``robot_tag`` / ``colors`` /
+    ``materials`` / ``collision`` / ``merge_fixed`` / ``mesh_dir`` are as for
+    :func:`write_ros_description_package`."""
+    pkg = ros_pkg_name(robot_name, pkg_name) if pkg_name \
+        else ros_pkg_name(robot_name + "_isaac", None)
+    if not pkg_name:
+        pkg = pkg[:-len("_description")]           # <robot>_isaac, not ..._description
+    urdf_stem = ros_urdf_stem(pkg, urdf_name)
+    files = build_ros_description(pkg_dir, robot_name, ros_version=1,
+                                  pkg_name=pkg, urdf_name=urdf_name,
+                                  robot_tag=robot_tag, colors=colors,
+                                  collision=collision,
+                                  coacd_quality=coacd_quality,
+                                  merge_fixed=merge_fixed, mesh_dir=mesh_dir,
+                                  zero_origins=zero_origins,
+                                  ctx_fmt=ISAAC_CTX_FMT, materials=materials,
+                                  url_style="relative")
+    files = [(arc, data) for arc, data in files
+             if not arc.endswith(("/package.xml", "/CMakeLists.txt"))]
+    files.append((f"{pkg}/README.md",
+                  ISAAC_README.format(pkg=pkg, urdf=urdf_stem).encode("utf-8")))
+    _write_files(dest_dir, files)
+    return os.path.join(os.path.abspath(dest_dir), pkg)
