@@ -1982,6 +1982,25 @@ def _solver_motion_signature(rec, tree_only=True):
     }
 
 
+def _snapshot_has_undescribed_freedom(state):
+    """True when a solver state reports freedom it could not describe.
+
+    Status 0 is free of motion and status 2 a constrained/unsupported slot.
+    Any other status on a slot that ``_solver_active_axes`` did not accept
+    (status 3 on a mid-chain arm link whose ancestors still move, or status 1
+    without a usable axis) means the described axis is only part of the
+    component's motion, so it must not stand in for a single joint.
+    """
+    active = {axis["slot"] for axis in _solver_active_axes(state)}
+    for prefix, group in (("R", "rotations"), ("L", "translations")):
+        for slot, axis in enumerate(state.get(group) or [], 1):
+            if f"{prefix}{slot}" in active or not isinstance(axis, dict):
+                continue
+            if _solver_int(axis.get("status")) not in (0, 2, None):
+                return True
+    return False
+
+
 def _component_solver_motion(component):
     """Return a single usable motion reported directly for *component*.
 
@@ -2000,6 +2019,8 @@ def _component_solver_motion(component):
         return None
     active = _solver_active_axes(state)
     if len(active) != 1:
+        return None
+    if _snapshot_has_undescribed_freedom(state):
         return None
     axis = active[0]
     direction = np.asarray(axis.get("direction"), float)
@@ -2235,6 +2256,11 @@ def _solver_joint(rec):
     # component may share the tree motion even though that edge is redundant;
     # leave the established mate-geometry fallback in charge there.
     if state.get("tree_edge") is False:
+        return None
+    # Graphs extracted before the snapshot check may still carry such a
+    # component snapshot on an edge; fall back to mate geometry for it.
+    if state.get("note") == "direct component snapshot" \
+            and _snapshot_has_undescribed_freedom(state):
         return None
     remaining = _solver_int(state.get("remaining_dofs"))
     child_fixed = state.get("child_fixed") is True

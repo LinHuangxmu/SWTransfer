@@ -232,6 +232,50 @@ def test_component_snapshot_attaches_to_matching_axis_edges():
     assert _solver_active_axes(state)[0]["type"] == "prismatic"
 
 
+def _arm_link_snapshot_raw():
+    # CR3AS LINK4 read with LINK1..LINK3 still free: R1 status 3 (rotation it
+    # cannot describe) next to one status-1 translation along LINK5's axis.
+    axis = [0.0573605, 0.8480465, -0.5268082]
+    return [0, 3, [0.0, 0.0, 0.0088], 0, [0.0, 0.0, 1.0],
+            0, [0.0, 0.0, 0.0], 0, [0.0, 0.0, 1.0],
+            1, axis, 0, None]
+
+
+def test_arm_link_snapshot_with_undescribed_rotation_is_not_attached():
+    link4 = Component("link4", "link4", "link4.SLDPRT", False,
+                      np.eye(4), False, 1)
+    link5 = Component("link5", "link5", "link5.SLDPRT", False,
+                      np.eye(4), False, 0)
+    link4.solver_dof = _solver_state_from_tuple(
+        _arm_link_snapshot_raw(), child_name="link4", child_origin=[0, 0, 0])
+    key = frozenset(("link4", "link5"))
+    adjacency = {key: {
+        "types": ["CONCENTRIC", "COINCIDENT"],
+        "axis": (np.zeros(3), np.array([0.0573605, 0.8480465, -0.5268082])),
+        "mates": [],
+    }}
+    assert _attach_component_solver_evidence(
+        [link4, link5], adjacency, {key}) == 0
+    assert adjacency[key].get("solver_dof") is None
+
+
+def test_stale_arm_link_snapshot_on_edge_falls_back_to_geometry():
+    # graph.json written before the snapshot check already carries the
+    # snapshot on the LINK4-LINK5 edge; build must not export it prismatic.
+    state = _solver_state_from_tuple(
+        _arm_link_snapshot_raw(), parent_name="link5", child_name="link4",
+        child_origin=[0, 0, 0])
+    state["tree_edge"] = True
+    state["note"] = "direct component snapshot"
+    rec = {
+        "types": ["CONCENTRIC", "COINCIDENT"],
+        "axis": (np.zeros(3), np.array([0.0573605, 0.8480465, -0.5268082])),
+        "mates": [], "solver_dof": state,
+    }
+    assert _solver_joint(rec) is None
+    assert classify_edge_auto(rec)[0] == "revolute"
+
+
 def test_component_snapshot_does_not_override_rigid_relative_mate():
     """A component's global travel must not become a rigid-edge joint.
 
